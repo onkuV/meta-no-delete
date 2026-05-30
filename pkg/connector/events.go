@@ -298,7 +298,6 @@ var (
 	_ bridgev2.RemoteEventWithTimestamp   = (*WAMessageEvent)(nil)
 	_ bridgev2.RemoteReaction             = (*WAMessageEvent)(nil)
 	_ bridgev2.RemoteReactionRemove       = (*WAMessageEvent)(nil)
-	_ bridgev2.RemoteMessageRemove        = (*WAMessageEvent)(nil)
 	_ bridgev2.RemoteEventWithStreamOrder = (*WAMessageEvent)(nil)
 )
 
@@ -422,7 +421,8 @@ func (evt *WAMessageEvent) GetType() bridgev2.RemoteEventType {
 		case *waConsumerApplication.ConsumerApplication_Payload_ApplicationData:
 			switch applicationContent := payload.ApplicationData.GetApplicationContent().(type) {
 			case *waConsumerApplication.ConsumerApplication_ApplicationData_Revoke:
-				return bridgev2.RemoteEventMessageRemove
+				// Intercept E2EE revokes so the bridge posts a notice instead of redacting.
+				return bridgev2.RemoteEventMessage
 			default:
 				log.Warn().Type("content_type", applicationContent).Msg("Unrecognized application content type")
 			}
@@ -459,7 +459,8 @@ func (evt *WAMessageEvent) GetType() bridgev2.RemoteEventType {
 	case *instamadilloAddMessage.AddMessagePayload:
 		return bridgev2.RemoteEventMessage
 	case *instamadilloDeleteMessage.DeleteMessagePayload:
-		return bridgev2.RemoteEventMessageRemove
+		// Intercept Instagram E2EE deletes so the bridge posts a notice instead of redacting.
+		return bridgev2.RemoteEventMessage
 	default:
 		if evt.Message == nil && evt.FBApplication.GetMetadata().GetChatEphemeralSetting() != nil {
 			return bridgev2.RemoteEventMessage
@@ -504,7 +505,37 @@ func (evt *WAMessageEvent) GetStreamOrder() int64 {
 }
 
 func (evt *WAMessageEvent) ConvertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI) (*bridgev2.ConvertedMessage, error) {
+	if deletedID, replyTo, ok := evt.deleteNoticeInfo(); ok {
+		zerolog.Ctx(ctx).Info().
+			Str("deleted_message_id", deletedID).
+			Msg("Intercepted E2EE message delete attempt, sending notice instead.")
+		return makeDeleteNoticeMessage(deletedID, replyTo), nil
+	}
 	return evt.m.Main.MsgConv.WhatsAppToMatrix(ctx, portal, evt.m.Client, evt.m.E2EEClient, intent, evt.GetID(), evt.FBMessage), nil
+}
+
+// deleteNoticeInfo reports whether this event is an E2EE delete/revoke and, if
+// so, returns the underlying network message ID being deleted plus a resolved
+// reply target (which may be empty when the protocol does not give us enough
+// data to map the deletion onto a known message — currently the Instagram
+// instamadillo delete payload, which carries only an OTID).
+func (evt *WAMessageEvent) deleteNoticeInfo() (deletedID string, replyTo networkid.MessageID, ok bool) {
+	switch typedMsg := evt.Message.(type) {
+	case *waConsumerApplication.ConsumerApplication:
+		appData, isAppData := typedMsg.GetPayload().GetPayload().(*waConsumerApplication.ConsumerApplication_Payload_ApplicationData)
+		if !isAppData {
+			return "", "", false
+		}
+		revoke, isRevoke := appData.ApplicationData.GetApplicationContent().(*waConsumerApplication.ConsumerApplication_ApplicationData_Revoke)
+		if !isRevoke {
+			return "", "", false
+		}
+		key := revoke.Revoke.GetKey()
+		return key.GetID(), evt.m.waKeyToMessageID(evt.Info.Chat, evt.Info.Sender, key), true
+	case *instamadilloDeleteMessage.DeleteMessagePayload:
+		return typedMsg.GetMessageOtid(), "", true
+	}
+	return "", "", false
 }
 
 func (evt *WAMessageEvent) ConvertEdit(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message) (*bridgev2.ConvertedEdit, error) {
@@ -589,16 +620,26 @@ func (evt *DeleteNoticeEvent) GetTimestamp() time.Time {
 }
 
 func (evt *DeleteNoticeEvent) ConvertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI) (*bridgev2.ConvertedMessage, error) {
-	return &bridgev2.ConvertedMessage{
-		ReplyTo: &networkid.MessageOptionalPartID{MessageID: metaid.MakeFBMessageID(evt.deletedMessageID)},
+	return makeDeleteNoticeMessage(evt.deletedMessageID, metaid.MakeFBMessageID(evt.deletedMessageID)), nil
+}
+
+// makeDeleteNoticeMessage builds the bridged "deletion attempted" notice used by
+// both the LS-tabular and E2EE delete intercepts. replyTo may be empty when the
+// underlying network ID of the deleted message cannot be resolved.
+func makeDeleteNoticeMessage(deletedID string, replyTo networkid.MessageID) *bridgev2.ConvertedMessage {
+	msg := &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{{
 			Type: event.EventMessage,
 			Content: &event.MessageEventContent{
 				MsgType: event.MsgText,
-				Body:    fmt.Sprintf("🚮 Message deletion attempted (ID: %s)", evt.deletedMessageID),
+				Body:    fmt.Sprintf("🚮 Message deletion attempted (ID: %s)", deletedID),
 			},
 		}},
-	}, nil
+	}
+	if replyTo != "" {
+		msg.ReplyTo = &networkid.MessageOptionalPartID{MessageID: replyTo}
+	}
+	return msg
 }
 
 type FBChatResync struct {
