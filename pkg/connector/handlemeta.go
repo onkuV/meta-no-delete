@@ -562,30 +562,8 @@ func (m *MetaClient) handleTypingIndicator(tk handlerParams, msg *table.LSUpdate
 	}
 }
 
-func wrapMessageDelete(portal networkid.PortalKey, uncertain bool, messageID string) *simplevent.MessageRemove {
-	return &simplevent.MessageRemove{
-		EventMeta: simplevent.EventMeta{
-			Type: bridgev2.RemoteEventMessageRemove,
-			LogContext: func(c zerolog.Context) zerolog.Context {
-				return c.Str("message_id", messageID)
-			},
-			PortalKey:         portal,
-			UncertainReceiver: uncertain,
-		},
-		TargetMessage: metaid.MakeFBMessageID(messageID),
-	}
-}
-
 func (m *MetaClient) handleDeleteMessage(tk handlerParams, msg *table.LSDeleteMessage) bridgev2.RemoteEvent {
-	zerolog.Ctx(tk.ctx).Info().Str("deleted_message_id", msg.MessageId).Msg("Intercepted message delete attempt, sending notice instead.")
-
-	return &DeleteNoticeEvent{
-		portalKey:         tk.Portal,
-		uncertainReceiver: tk.IsUncertainReceiver(),
-		deletedMessageID:  msg.MessageId,
-		timestamp:         time.Now(),
-		m:                 m,
-	}
+	return m.wrapMessageDeleteNotice(tk, msg.MessageId)
 }
 
 func (m *MetaClient) handleDeleteThenInsertMessage(tk handlerParams, msg *table.LSDeleteThenInsertMessage) bridgev2.RemoteEvent {
@@ -596,7 +574,20 @@ func (m *MetaClient) handleDeleteThenInsertMessage(tk handlerParams, msg *table.
 			Msg("Got unexpected non-unsend DeleteThenInsertMessage command")
 		return nil
 	}
-	return wrapMessageDelete(tk.Portal, tk.IsUncertainReceiver(), msg.MessageId)
+	// Some Messenger unsend flows ship as DeleteThenInsertMessage{IsUnsent: true}
+	// instead of LSDeleteMessage; both routes must produce the deletion notice.
+	return m.wrapMessageDeleteNotice(tk, msg.MessageId)
+}
+
+func (m *MetaClient) wrapMessageDeleteNotice(tk handlerParams, messageID string) bridgev2.RemoteEvent {
+	zerolog.Ctx(tk.ctx).Info().Str("deleted_message_id", messageID).Msg("Intercepted message delete attempt, sending notice instead.")
+	return &DeleteNoticeEvent{
+		portalKey:         tk.Portal,
+		uncertainReceiver: tk.IsUncertainReceiver(),
+		deletedMessageID:  messageID,
+		timestamp:         time.Now(),
+		m:                 m,
+	}
 }
 
 func (m *MetaClient) handleDeleteThenInsertMessageRequest(tk handlerParams, msg *table.LSDeleteThenInsertMessageRequest) bridgev2.RemoteEvent {
