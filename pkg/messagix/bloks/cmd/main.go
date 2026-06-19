@@ -24,6 +24,8 @@ import (
 
 var filename = flag.String("file", "", "Bloks response to parse")
 var doPrint = flag.Bool("print", false, "Pretty-print the bundle")
+var doRedact = flag.Bool("redact", false, "Pretty-print the bundle but in redacted form")
+var doExport = flag.Bool("export", false, "Print the bundle in a format that can be parsed again")
 var doHTML = flag.Bool("html", false, "Print as HTML")
 var doLogin = flag.Bool("login", false, "Click the login button")
 var do2FA = flag.String("2fa", "", "Submit a two-factor code")
@@ -42,6 +44,10 @@ var doSMSCode = flag.String("sms-code", "", "Submit SMS code")
 var doBackupCode = flag.String("backup-code", "", "Submit backup code")
 var doEncrypt = flag.String("encrypt", "", "Encrypt a password")
 var deviceID = flag.String("device-id", "", "Device ID for password encryption")
+var doCaptcha = flag.String("captcha-code", "", "Captcha code to submit")
+var captchaResponse = flag.String("captcha-resp", "", "Bloks response for captcha submission")
+var doWhatsAppNumbers = flag.Bool("whatsapp-numbers", false, "Print the available WhatsApp numbers")
+var selectedWhatsAppNumber = flag.String("whatsapp-number", "", "Pick a WhatsApp number and submit")
 
 func main() {
 	err := mainE()
@@ -52,6 +58,9 @@ func main() {
 }
 
 func readAndParse[T any](filename string) (*T, error) {
+	if filename == "-" {
+		filename = "/dev/stdin"
+	}
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
@@ -141,28 +150,60 @@ func mainE() error {
 		return err
 	}
 	if *doPrint {
-		return bundle.Print("")
+		return bundle.Print(os.Stdout, "")
+	}
+	if *doRedact {
+		bundle.Redact()
+		return bundle.Print(os.Stdout, "")
+	}
+	if *doExport {
+		out, err := json.Marshal(bundle)
+		if err != nil {
+			return err
+		}
+		os.Stdout.Write(out)
+		fmt.Println()
+		return nil
 	}
 	if *doHTML {
-		return bundle.PrintHTML("")
+		return bundle.PrintHTML(os.Stdout, "")
 	}
 	lastURL := ""
 	bridge := bloks.InterpBridge{
-		DoRPC: func(ctx context.Context, name string, params map[string]string, isPage bool, callback func(result *bloks.BloksScriptLiteral) error) error {
-			fmt.Printf("%s isPage=%v\n", name, isPage)
+		DoPageRPC: func(ctx context.Context, name string, params map[string]string) (*bloks.BloksBundle, error) {
+			fmt.Printf("%s type=page\n", name)
 			payload, err := json.Marshal(params)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			fmt.Printf("%s\n", string(payload))
-			return nil
+			return nil, nil
+		},
+		DoActionRPC: func(ctx context.Context, name string, params map[string]string) (*bloks.BloksScriptNode, error) {
+			fmt.Printf("%s type=action\n", name)
+			payload, err := json.Marshal(params)
+			if err != nil {
+				return nil, err
+			}
+			fmt.Printf("%s\n", string(payload))
+			if *captchaResponse != "" {
+				bundle, err := readAndParse[bloks.BloksBundle](*captchaResponse)
+				if err != nil {
+					return nil, err
+				}
+				fmt.Printf("(providing response from %s)\n", *captchaResponse)
+				return bundle.Action(), nil
+			}
+			return &bloks.BloksScriptNode{
+				Content: bloks.BloksNull,
+			}, nil
 		},
 		HandleLoginResponse: func(ctx context.Context, data string) error {
 			fmt.Printf("%s\n", data)
 			return nil
 		},
 		StartTimer: func(name string, interval time.Duration, callback func() error) error {
-			for i := 0; i < 3; i++ {
+			for range 3 {
 				err := callback()
 				if err != nil {
 					return err
@@ -177,8 +218,12 @@ func mainE() error {
 			lastURL = url
 			return nil
 		},
+		HandleVariableChange: func(ctx context.Context, name string, value *bloks.BloksScriptLiteral) error {
+			log.Trace().Str("variable", name).Any("value", value.Flatten(false)).Msg("Handling variable value change")
+			return nil
+		},
 	}
-	interp, err := bloks.NewInterpreter(ctx, bundle, &bridge, nil)
+	interp, err := bloks.NewInterpreter(ctx, bundle, &bridge, nil, true)
 	if err != nil {
 		return err
 	}
@@ -220,7 +265,7 @@ func mainE() error {
 		if *doLogin {
 			interp.Bridge.DisplayNewScreen = func(ctx context.Context, name string, newBundle *bloks.BloksBundle) error {
 				bundle = newBundle
-				interp, err = bloks.NewInterpreter(ctx, bundle, &bridge, interp)
+				interp, err = bloks.NewInterpreter(ctx, bundle, &bridge, interp, true)
 				if err != nil {
 					return err
 				}
@@ -248,7 +293,7 @@ func mainE() error {
 			if !ok {
 				return false
 			}
-			str, ok := name.BloksJavascriptValue.(string)
+			str, ok := name.BloksJavaScriptValue.(string)
 			if !ok {
 				return false
 			}
@@ -283,7 +328,7 @@ func mainE() error {
 			if !ok {
 				return false
 			}
-			str, ok := text.BloksJavascriptValue.(string)
+			str, ok := text.BloksJavaScriptValue.(string)
 			if !ok {
 				return false
 			}
@@ -346,7 +391,7 @@ func mainE() error {
 				if !ok {
 					return false
 				}
-				str, ok := label.BloksJavascriptValue.(string)
+				str, ok := label.BloksJavaScriptValue.(string)
 				if !ok {
 					return false
 				}
@@ -414,6 +459,24 @@ func mainE() error {
 			return fmt.Errorf("tap continue: %w", err)
 		}
 	} else if *afad {
+		notif := bundle.FindDescendant(func(comp *bloks.BloksTreeComponent) bool {
+			if comp.ComponentID != "bk.data.TextSpan" {
+				return false
+			}
+			for _, prefix := range []string{
+				"We sent a notification",
+				"Open the notification",
+			} {
+				if strings.HasPrefix(comp.GetAttribute("text"), prefix) {
+					return true
+				}
+			}
+			return false
+		})
+		if notif == nil {
+			return fmt.Errorf("couldn't find AFAD notification info")
+		}
+		fmt.Println(notif.GetAttribute("text"))
 		for _, comp := range bundle.FindDescendants(func(comp *bloks.BloksTreeComponent) bool {
 			if comp.ComponentID != "bk.components.VisibilityExtension" {
 				return false
@@ -427,36 +490,76 @@ func mainE() error {
 			}
 		}
 	} else if *captcha {
-		img := bundle.FindDescendant(bloks.FilterByAttribute("bk.components.Image", "unique_id", "i:com.bloks.www.two_step_verification.enter_text_captcha_code/p:captcha_image"))
-		if img == nil {
-			return fmt.Errorf("can't find captcha image")
+		getURLs := func() (string, string, error) {
+			img := bundle.FindDescendant(bloks.FilterByAttribute("bk.components.Image", "unique_id", "i:com.bloks.www.two_step_verification.enter_text_captcha_code/p:captcha_image"))
+			if img == nil {
+				return "", "", fmt.Errorf("can't find captcha image")
+			}
+			imageURL := img.GetDynamicAttribute(ctx, interp, "url")
+			if imageURL == "" {
+				return "", "", fmt.Errorf("captcha image has no url")
+			}
+			audio := bundle.FindDescendant(bloks.FilterByAttribute("bk.data.TextSpan", "text", "play audio"))
+			if audio == nil {
+				return "", "", fmt.Errorf("can't find audio text")
+			}
+			clickable := audio.FindDescendant(bloks.FilterByComponent("bk.style.textspan.ClickableStyle"))
+			if clickable == nil {
+				return "", "", fmt.Errorf("audio text is not clickable")
+			}
+			onClick := clickable.GetScript("on_click")
+			if onClick == nil {
+				return "", "", fmt.Errorf("no on_click on audio text")
+			}
+			_, err := interp.Evaluate(ctx, &onClick.AST)
+			if err != nil {
+				return "", "", fmt.Errorf("clicking on audio text: %w", err)
+			}
+			if lastURL == "" {
+				return "", "", fmt.Errorf("clicking on audio text failed to open url")
+			}
+			audioURL := strings.Replace(lastURL, "/player/", "/", 1)
+			lastURL = ""
+			return imageURL, audioURL, nil
 		}
-		imageURL := img.GetDynamicAttribute(ctx, interp, "url")
-		if imageURL == "" {
-			return fmt.Errorf("captcha image has no url")
+		imageURL, audioURL, err := getURLs()
+		if err != nil {
+			return err
 		}
 		fmt.Println("Image:", imageURL)
-		audio := bundle.FindDescendant(bloks.FilterByAttribute("bk.data.TextSpan", "text", "play audio"))
-		if audio == nil {
-			return fmt.Errorf("can't find audio text")
-		}
-		clickable := audio.FindDescendant(bloks.FilterByComponent("bk.style.textspan.ClickableStyle"))
-		if clickable == nil {
-			return fmt.Errorf("audio text is not clickable")
-		}
-		onClick := clickable.GetScript("on_click")
-		if onClick == nil {
-			return fmt.Errorf("no on_click on audio text")
-		}
-		_, err := interp.Evaluate(ctx, &onClick.AST)
-		if err != nil {
-			return fmt.Errorf("clicking on audio text: %w", err)
-		}
-		if lastURL == "" {
-			return fmt.Errorf("clicking on audio text failed to open url")
-		}
-		audioURL := strings.Replace(lastURL, "/player/", "/", 1)
 		fmt.Println("Audio:", audioURL)
+		if *doCaptcha != "" {
+			err := bundle.
+				FindDescendant(func(comp *bloks.BloksTreeComponent) bool {
+					if comp.ComponentID != "bk.components.TextInput" {
+						return false
+					}
+					return comp.FindDescendant(bloks.FilterByAttribute(
+						"bk.components.AccessibilityExtension", "label", "Enter characters",
+					)) != nil
+				}).
+				FillInput(ctx, interp, *doCaptcha)
+			if err != nil {
+				return fmt.Errorf("filling captcha code input: %w", err)
+			}
+			err = bundle.
+				FindDescendant(bloks.FilterByAttribute("bk.data.TextSpan", "text", "Continue")).
+				FindContainingButton().
+				TapButton(ctx, interp)
+			if err != nil {
+				return fmt.Errorf("tapping continue: %w", err)
+			}
+		}
+		newImageURL, newAudioURL, err := getURLs()
+		if err != nil {
+			return err
+		}
+		if newImageURL != imageURL {
+			fmt.Println("New image:", newImageURL)
+		}
+		if newAudioURL != audioURL {
+			fmt.Println("New audio:", newAudioURL)
+		}
 	} else if *doSMSCode != "" {
 		err := bundle.
 			FindDescendant(func(comp *bloks.BloksTreeComponent) bool {
@@ -500,6 +603,38 @@ func mainE() error {
 			TapButton(ctx, interp)
 		if err != nil {
 			return fmt.Errorf("tapping continue: %w", err)
+		}
+	} else if *doWhatsAppNumbers {
+		buttons := bundle.
+			FindDescendants(func(comp *bloks.BloksTreeComponent) bool {
+				if comp.ComponentID != "bk.components.AccessibilityExtension" {
+					return false
+				}
+				if !strings.HasPrefix(comp.GetAttribute("label"), "+") {
+					return false
+				}
+				return true
+			})
+		foundNumbers := map[string]*bloks.BloksTreeComponent{}
+		fmt.Printf("Found %d WhatsApp number(s):\n", len(buttons))
+		for _, btn := range buttons {
+			number := btn.GetAttribute("label")
+			foundNumbers[number] = btn
+			fmt.Printf("- %s\n", number)
+		}
+		if *selectedWhatsAppNumber == "" {
+			return nil
+		}
+		err := foundNumbers[*selectedWhatsAppNumber].FindContainingButton().TapButton(ctx, interp)
+		if err != nil {
+			return fmt.Errorf("tap selected number: %w", err)
+		}
+		err = bundle.
+			FindDescendant(bloks.FilterByAttribute("bk.data.TextSpan", "text", "Continue")).
+			FindContainingButton().
+			TapButton(ctx, interp)
+		if err != nil {
+			return fmt.Errorf("tap continue: %w", err)
 		}
 	}
 	return nil
