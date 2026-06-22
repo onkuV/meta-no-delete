@@ -2,7 +2,7 @@
 
 Fork of mautrix-meta, but with deleting of messages deleted. Instead of a message getting deleted, the bridge will instead alert you that the other user has attempted to delete a message.
 
-You can find a pushed Docker image ready to use here: https://hub.docker.com/r/dvcrn/matrix-meta-nodelete
+You can find a pushed Docker image ready to use here: https://hub.docker.com/r/onkuV/matrix-meta-nodelete
 
 ## Documentation
 All setup and usage instructions are located on [docs.mau.fi]. Some quick links:
