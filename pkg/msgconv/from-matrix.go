@@ -18,28 +18,19 @@ package msgconv
 
 import (
 	"context"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
-	"go.mau.fi/util/ffmpeg"
-	"go.mau.fi/util/random"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
-	"maunium.net/go/mautrix/format"
-	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
-	"go.mau.fi/mautrix-meta/pkg/messagix/types"
-	"go.mau.fi/mautrix-meta/pkg/messagix/useragent"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
+	"go.mau.fi/mautrix-meta/pkg/msgconv/mediadl"
 )
 
 func (mc *MessageConverter) ToMeta(
@@ -114,13 +105,11 @@ func (mc *MessageConverter) ToMeta(
 	}
 	switch content.MsgType {
 	case event.MsgText, event.MsgNotice, event.MsgEmote:
-		if content.Format == event.FormatHTML {
-			mc.parseFormattedBody(ctx, content, task, portal)
-		} else {
-			task.Text = content.Body
-		}
+		text, mentions := mc.HTMLParser.Parse(ctx, content, portal)
+		task.MentionData = mentions.ToData()
+		task.Text = text
 	case event.MsgImage, event.MsgVideo, event.MsgAudio, event.MsgFile:
-		attachmentID, err := mc.reuploadFileToMeta(ctx, client, portal, content)
+		attachmentID, err := mediadl.ReuploadFileToMeta(ctx, client.GetHTTP(), portal, content)
 		if err != nil {
 			return nil, err
 		}
@@ -143,204 +132,4 @@ func (mc *MessageConverter) ToMeta(
 		LastReadWatermarkTs: time.Now().UnixMilli(),
 	}
 	return []socket.Task{task, readTask}, nil
-}
-
-const mentionLocator = "meta_mention_"
-
-type MetaMention struct {
-	Locator string
-	Name    string
-	UserID  int64
-}
-
-func NewMetaMention(userID int64, name string) *MetaMention {
-	return &MetaMention{
-		Locator: mentionLocator + random.String(16),
-		Name:    name,
-		UserID:  userID,
-	}
-}
-
-func (mc *MessageConverter) convertPill(displayname, mxid, eventID string, ctx format.Context) string {
-	if len(mxid) == 0 || mxid[0] != '@' {
-		return format.DefaultPillConverter(displayname, mxid, eventID, ctx)
-	}
-	var userID int64
-	var username string
-	ghost, err := mc.Bridge.GetGhostByMXID(ctx.Ctx, id.UserID(mxid))
-	if err != nil {
-		zerolog.Ctx(ctx.Ctx).Err(err).Str("mxid", mxid).Msg("Failed to get user for mention")
-		return displayname
-	} else if ghost != nil {
-		username = ghost.Metadata.(*metaid.GhostMetadata).Username
-		if username == "" {
-			username = ghost.Name
-		}
-		userID = metaid.ParseUserID(ghost.ID)
-	} else if user, err := mc.Bridge.GetExistingUserByMXID(ctx.Ctx, id.UserID(mxid)); err != nil {
-		zerolog.Ctx(ctx.Ctx).Err(err).Str("mxid", mxid).Msg("Failed to get user for mention")
-		return displayname
-	} else if user != nil {
-		portal := ctx.ReturnData["portal"].(*bridgev2.Portal)
-		login, _, _ := portal.FindPreferredLogin(ctx.Ctx, user, false)
-		if login == nil {
-			return displayname
-		}
-		userID = metaid.ParseUserLoginID(login.ID)
-		if login.Metadata.(*metaid.UserLoginMetadata).Platform.IsMessenger() || login.RemoteProfile.Username == "" {
-			username = login.RemoteProfile.Name
-		} else {
-			username = login.RemoteProfile.Username
-		}
-	} else {
-		return displayname
-	}
-	mention := NewMetaMention(userID, username)
-	mentions := ctx.ReturnData["mentions"].(*[]*MetaMention)
-	*mentions = append(*mentions, mention)
-	return mention.Locator
-}
-
-func (mc *MessageConverter) parseFormattedBody(ctx context.Context, content *event.MessageEventContent, task *socket.SendMessageTask, portal *bridgev2.Portal) {
-	mentions := make([]*MetaMention, 0)
-
-	parseCtx := format.NewContext(ctx)
-	parseCtx.ReturnData["mentions"] = &mentions
-	parseCtx.ReturnData["portal"] = portal
-	parsed := mc.HTMLParser.Parse(content.FormattedBody, parseCtx)
-
-	var socketMentions socket.Mentions
-
-	for _, mention := range mentions {
-		mentionIndex := strings.Index(parsed, mention.Locator)
-		if mentionIndex == -1 {
-			zerolog.Ctx(ctx).Warn().Any("mention", mention).Msg("Mention not found in parsed body")
-			continue
-		}
-
-		parsed = parsed[:mentionIndex] + "@" + mention.Name + parsed[mentionIndex+len(mention.Locator):]
-
-		socketMentions = append(socketMentions, socket.Mention{
-			ID:     mention.UserID,
-			Offset: mentionIndex,
-			Length: len("@" + mention.Name),
-			Type:   socket.MentionTypePerson,
-		})
-	}
-
-	task.MentionData = socketMentions.ToData()
-	task.Text = parsed
-}
-
-func (mc *MessageConverter) reuploadFileToMeta(ctx context.Context, client *messagix.Client, portal *bridgev2.Portal, content *event.MessageEventContent) (int64, error) {
-	threadID := metaid.ParseFBPortalID(portal.ID)
-	mime := content.Info.MimeType
-	fileName := content.Body
-	if content.FileName != "" {
-		fileName = content.FileName
-	}
-	data, err := mc.Bridge.Bot.DownloadMedia(ctx, content.URL, content.File)
-	if err != nil {
-		return 0, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
-	}
-	if mime == "" {
-		mime = http.DetectContentType(data)
-	}
-	isVoice := content.MSC3245Voice != nil
-	if isVoice && ffmpeg.Supported() {
-		data, err = ffmpeg.ConvertBytes(ctx, data, ".m4a", []string{}, []string{"-c:a", "aac"}, mime)
-		if err != nil {
-			return 0, fmt.Errorf("%w (ogg to m4a): %w", bridgev2.ErrMediaConvertFailed, err)
-		}
-		mime = "audio/mp4"
-		fileName += ".m4a"
-	}
-	resp, err := client.SendMercuryUploadRequest(ctx, threadID, &messagix.MercuryUploadMedia{
-		Filename:    fileName,
-		MimeType:    mime,
-		MediaData:   data,
-		IsVoiceClip: isVoice,
-	})
-	if err != nil {
-		zerolog.Ctx(ctx).Debug().
-			Str("file_name", fileName).
-			Str("mime_type", mime).
-			Bool("is_voice_clip", isVoice).
-			Msg("Failed upload metadata")
-		return 0, fmt.Errorf("%w: %w", bridgev2.ErrMediaReuploadFailed, err)
-	}
-	attachmentID := resp.Payload.RealMetadata.GetFbId()
-	if attachmentID == 0 {
-		zerolog.Ctx(ctx).Warn().RawJSON("response", resp.Raw).Msg("No fbid received for upload")
-	}
-	if attachmentID == 0 && content.MsgType == event.MsgVideo && client.Platform == types.Instagram {
-		attachmentID, err = mc.reuploadVideoToMetaFallback(ctx, client, data, mime)
-		if err != nil {
-			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to upload attachment via Instagram Android fallback")
-			return 0, fmt.Errorf("%w: fallback upload failed: %w", bridgev2.ErrMediaReuploadFailed, err)
-		} else {
-			zerolog.Ctx(ctx).Info().Msg("Uploaded attachment via Instagram Android fallback")
-		}
-	}
-	if attachmentID == 0 {
-		return 0, fmt.Errorf("%w: fbid not received", bridgev2.ErrMediaReuploadFailed)
-	}
-	return attachmentID, nil
-}
-
-// There is a subset of Instagram accounts that are for some reason unable to upload
-// videos through the Instagram web API (even using the official Instagram website).
-// All other uploads and messages work fine (image, audio, file), it is specifically
-// videos. For these accounts, the Instagram Android API still works and we use it as
-// a fallback.
-func (mc *MessageConverter) reuploadVideoToMetaFallback(ctx context.Context, client *messagix.Client, data []byte, mime string) (int64, error) {
-	uploadID := fmt.Sprintf(
-		"%s-%d-%d-%d-%d",
-		hex.EncodeToString(random.Bytes(16)),
-		0, // maybe this will change some day
-		len(data),
-		time.Now().Unix()*1000,
-		time.Now().UnixMilli(),
-	)
-	h := http.Header{}
-	h.Add("accept-language", "en-US")
-	h.Add("authorization", client.GetRUploadToken())
-	h.Add("ig-intended-user-id", client.GetCookies().Get("ds_user_id"))
-	h.Add("ig-u-ds-user-id", client.GetCookies().Get("ds_user_id"))
-	h.Add("ig-u-rur", client.GetCookies().Get("rur"))
-	h.Add("offset", "0")
-	h.Add("segment-start-offset", "0")
-	h.Add("segment-type", "3")
-	h.Add("user-agent", useragent.AndroidUserAgent)
-	h.Add("video_type", "FILE_ATTACHMENT")
-	h.Add("x-entity-length", fmt.Sprintf("%d", len(data)))
-	h.Add("x-entity-name", uploadID)
-	h.Add("x-entity-type", mime)
-	h.Add("x-fb-client-ip", "True")
-	h.Add("x-fb-friendly-name", "undefined:media-upload")
-	h.Add("x-fb-http-engine", "Tigon/MNS/TCP")
-	h.Add("x-fb-rmd", "state=URL_ELIGIBLE")
-	h.Add("x-fb-server-cluster", "True")
-	h.Add("x-zero-balance", "INIT")
-	h.Add("x-zero-eh", "")
-	resp, body, err := client.MakeRequest(
-		ctx,
-		fmt.Sprintf("https://rupload.facebook.com/messenger_video/%s", uploadID),
-		"POST",
-		h,
-		data,
-		"application/octet-stream",
-	)
-	if err != nil {
-		return 0, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("bad status: %d", resp.StatusCode)
-	}
-	var respData messagix.RUploadResponse
-	err = json.Unmarshal(body, &respData)
-	if err != nil {
-		return 0, err
-	}
-	return respData.MediaID, nil
 }

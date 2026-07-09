@@ -5,11 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 
 	"github.com/google/go-querystring/query"
 	"go.mau.fi/util/jsonbytes"
 
+	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 )
 
@@ -30,7 +30,7 @@ func (fb *FacebookMethods) RegisterPushNotifications(ctx context.Context, endpoi
 		return err
 	}
 
-	payload := c.newHTTPQuery()
+	payload := c.http.NewHTTPQuery()
 	payload.AppID = "1443096165982425"
 	payload.PushEndpoint = endpoint
 	payload.SubscriptionKeys = string(jsonKeys)
@@ -42,23 +42,19 @@ func (fb *FacebookMethods) RegisterPushNotifications(ctx context.Context, endpoi
 
 	payloadBytes := []byte(form.Encode())
 
-	headers := c.buildHeaders(true, false)
+	headers := c.http.BuildHeaders(true, false)
 	headers.Set("Referer", c.GetEndpoint("base_url"))
 	headers.Set("Sec-fetch-site", "same-origin")
 	headers.Set("Accept", "*/*")
 
 	url := c.GetEndpoint("web_push")
 
-	resp, body, err := c.MakeRequest(ctx, url, "POST", headers, payloadBytes, types.FORM)
+	_, body, err := c.http.MakeRequest(ctx, url, "POST", headers, payloadBytes, types.FORM)
 	if err != nil {
 		return err
 	}
 
-	if resp.StatusCode >= 300 || resp.StatusCode < 200 {
-		return fmt.Errorf("bad status code: %d", resp.StatusCode)
-	}
-
-	body = bytes.TrimPrefix(body, antiJSPrefix)
+	body = bytes.TrimPrefix(body, httpclient.AntiJSPrefix)
 
 	var r pushNotificationsResponse
 	err = json.Unmarshal(body, &r)

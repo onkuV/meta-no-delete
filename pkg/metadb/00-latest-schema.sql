@@ -1,4 +1,4 @@
--- v0 -> v6 (compatible with v1+): Latest schema
+-- v0 -> v10 (compatible with v8+): Latest schema
 CREATE TABLE meta_thread (
     parent_key BIGINT NOT NULL,
     thread_key BIGINT NOT NULL,
@@ -9,9 +9,9 @@ CREATE TABLE meta_thread (
 );
 
 CREATE TABLE meta_reconnection_state (
-    bridge_id TEXT   NOT NULL,
-    login_id  TEXT   NOT NULL,
-    state     jsonb  NOT NULL,
+    bridge_id TEXT  NOT NULL,
+    login_id  TEXT  NOT NULL,
+    state     jsonb NOT NULL,
     last_used BIGINT,
 
     PRIMARY KEY (bridge_id, login_id),
@@ -19,30 +19,56 @@ CREATE TABLE meta_reconnection_state (
         REFERENCES user_login (bridge_id, id) ON DELETE CASCADE
 );
 
--- On Instagram every FBID has two IGIDs associated with it
--- e.g.         FBID 17843099136558503
---      "short" IGID 76594782502
---      "long"  IGID 340282366841710301244276018116713645479
---
--- It appears these are user IDs and thread IDs respectively
---
--- These tables let us cache those values as they are not currently
--- known to ever change, and then we don't need to fetch them again
--- for a user/thread
---
--- Primary key on the igid since we primarily use fbid everywhere and
--- only need a way to translate from igid when we receive igid from
--- legacy API endpoints
---
--- Index on the fbid because occasionally we have to go the other way,
--- for example looking up FB contacts on Instagram
+CREATE TABLE meta_instagram_seq_id (
+    bridge_id TEXT   NOT NULL,
+    login_id  TEXT   NOT NULL,
+    seq_id    BIGINT NOT NULL,
+    timestamp BIGINT NOT NULL,
 
-CREATE TABLE meta_instagram_user_id (
-  igid TEXT PRIMARY KEY,
-  fbid BIGINT NOT NULL UNIQUE
+    PRIMARY KEY (bridge_id, login_id),
+    CONSTRAINT meta_reconnection_state_user_login_fkey FOREIGN KEY (bridge_id, login_id)
+        REFERENCES user_login (bridge_id, id) ON DELETE CASCADE
 );
 
+-- Short IG user ID <-> FB user ID
+CREATE TABLE meta_instagram_user_id (
+    igid TEXT PRIMARY KEY,
+    fbid BIGINT NOT NULL UNIQUE
+);
+
+-- Long IG thread ID <-> FB thread key
 CREATE TABLE meta_instagram_thread_id (
-  igid TEXT PRIMARY KEY,
-  fbid BIGINT NOT NULL UNIQUE
+    bridge_id TEXT   NOT NULL,
+    igid      TEXT   NOT NULL,
+    fbid      BIGINT NOT NULL,
+    login     TEXT   NOT NULL,
+
+    PRIMARY KEY (igid, login),
+    CONSTRAINT ig_thread_fbid_unique UNIQUE (fbid, login)
+);
+
+
+-- Short IG chat ID <-> FB thread key.
+-- For groups, these two are usually the same value.
+-- For DMs, the fbid is the recipient user ID, but the igid is a different short ID.
+CREATE TABLE meta_instagram_chat_id (
+    igid  TEXT   NOT NULL,
+    fbid  BIGINT NOT NULL,
+    login TEXT   NOT NULL,
+
+    PRIMARY KEY (igid, login),
+    CONSTRAINT ig_chat_fbid_unique UNIQUE (fbid, login)
+);
+
+CREATE TABLE meta_instagram_reaction (
+    bridge_id           TEXT   NOT NULL,
+    portal_id           TEXT   NOT NULL,
+    portal_receiver     TEXT   NOT NULL,
+    target_message_id   TEXT   NOT NULL,
+    reaction_sender     BIGINT NOT NULL,
+    reaction_message_id TEXT   NOT NULL,
+
+    PRIMARY KEY (bridge_id, portal_receiver, reaction_message_id),
+    CONSTRAINT ig_reaction_portal_fkey FOREIGN KEY (bridge_id, portal_id, portal_receiver)
+        REFERENCES portal (bridge_id, id, receiver) ON DELETE CASCADE ON UPDATE CASCADE
 );

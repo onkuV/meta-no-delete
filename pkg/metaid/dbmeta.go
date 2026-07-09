@@ -12,6 +12,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
+	"go.mau.fi/mautrix-meta/pkg/messagix/pushcrypto"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 )
@@ -23,28 +24,24 @@ type MessageMetadata struct {
 
 type GhostMetadata struct {
 	Username string `json:"username,omitempty"`
+	IGID     string `json:"igid,omitempty"`
 }
 
 type UserLoginMetadata struct {
-	Platform   types.Platform   `json:"platform"`
-	Cookies    *cookies.Cookies `json:"cookies"`
-	WADeviceID uint16           `json:"wa_device_id,omitempty"`
-	PushKeys   *PushKeys        `json:"push_keys,omitempty"`
-	LoginUA    string           `json:"login_ua,omitempty"`
+	Platform   types.Platform       `json:"platform"`
+	Cookies    *cookies.Cookies     `json:"cookies"`
+	WADeviceID uint16               `json:"wa_device_id,omitempty"`
+	PushKeys   *pushcrypto.PushKeys `json:"push_keys,omitempty"`
+	LoginUA    string               `json:"login_ua,omitempty"`
+	IGID       string               `json:"igid,omitempty"`
 
 	// Thread backfill state
 	BackfillCompleted bool `json:"backfill_completed,omitempty"`
 }
 
-type PushKeys struct {
-	P256DH  []byte `json:"p256dh"`
-	Auth    []byte `json:"auth"`
-	Private []byte `json:"private"`
-}
-
 func (m *UserLoginMetadata) GeneratePushKeys() {
 	privateKey := exerrors.Must(ecdh.P256().GenerateKey(rand.Reader))
-	m.PushKeys = &PushKeys{
+	m.PushKeys = &pushcrypto.PushKeys{
 		P256DH:  privateKey.Public().(*ecdh.PublicKey).Bytes(),
 		Auth:    random.Bytes(16),
 		Private: privateKey.Bytes(),
@@ -59,6 +56,9 @@ type PortalMetadata struct {
 	// WhatsApp thread JID (the result of MapWhatsAppThreadKey), but some tasks (e.g. accepting a
 	// message request) need the original Facebook key instead.
 	FBThreadKey int64 `json:"fb_thread_key,omitempty"`
+
+	IGID       string `json:"igid,omitempty"`
+	IGThreadID string `json:"ig_thread_id,omitempty"`
 
 	EphemeralSettingTimestamp int64 `json:"ephemeral_setting_timestamp,omitempty"`
 

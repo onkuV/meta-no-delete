@@ -9,52 +9,130 @@ type GraphQLDoc struct {
 	Jsessw string
 }
 
+const IGDSlideDeltaProcessorQuery = "28239922265610241"
+const IGDTypingIndicatorClientSubscription = "27563068933278040"
+
 var GraphQLDocs = map[string]GraphQLDoc{
 	"LSGraphQLRequest": {
 		DocID:        "7357432314358409",
-		CallerClass:  "RelayModern",
 		FriendlyName: "LSPlatformGraphQLLightspeedRequestQuery",
 	},
 	"LSGraphQLRequestIG": {
 		DocID:        "6195354443842040",
-		CallerClass:  "RelayModern",
 		FriendlyName: "LSPlatformGraphQLLightspeedRequestForIGDQuery",
 	},
 	"MAWCatQuery": {
 		DocID:        "23999698219677129",
-		CallerClass:  "RelayModern",
 		FriendlyName: "MAWCatQuery",
 		Jsessw:       "1",
 	},
-	"IGDeleteThread": {
-		DocID:        "23915602751379354",
-		CallerClass:  "RelayModern",
-		FriendlyName: "IGDInboxInfoDeleteThreadDialogOffMsysMutation",
-	},
-	"IGEditGroupTitle": {
-		DocID:        "29088580780787855",
-		CallerClass:  "RelayModern",
+	"IGDEditThreadNameDialogOffMsysMutation": {
+		DocID:        "26508340268868683",
 		FriendlyName: "IGDEditThreadNameDialogOffMsysMutation",
 	},
-	"IGAcceptMessageRequest": {
-		DocID:        "25093807760274522",
-		CallerClass:  "RelayModern",
+	"useIGDirectAcceptMessageRequestMutation": {
+		DocID:        "36571001125823973",
 		FriendlyName: "useIGDirectAcceptMessageRequestMutation",
 	},
-	"IGListMessageRequests": {
-		DocID:        "25843909248644743",
-		CallerClass:  "RelayModern",
+	"PolarisDirectMessageRequestQuery": {
+		DocID:        "27512223021750545",
 		FriendlyName: "PolarisDirectMessageRequestQuery",
 	},
-	"IGUpdateGroupAvatar": {
+	"IGDirectUpdateThreadImageMutation": {
 		ClientDocID:  "5576567352987267181917649770",
-		CallerClass:  "RelayModern",
 		FriendlyName: "IGDirectUpdateThreadImageMutation",
 	},
-	"IGRemoveGroupAvatar": {
+	"IGDirectRemoveThreadImageMutation": {
 		ClientDocID:  "50027745118339199321503686240",
-		CallerClass:  "RelayModern",
 		FriendlyName: "IGDirectRemoveThreadImageMutation",
+	},
+	"PolarisDirectInboxQuery": {
+		DocID:        "27262915580045003",
+		FriendlyName: "PolarisDirectInboxQuery",
+	},
+	"useIGDSystemFolderUnreadThreadCountQuery": {
+		DocID:        "26619714737686638",
+		FriendlyName: "useIGDSystemFolderUnreadThreadCountQuery",
+	},
+	"IGDThreadDetailQuery": {
+		DocID:        "37117700834487428",
+		FriendlyName: "IGDThreadDetailQuery",
+	},
+	"IGDSlideAsyncFetchAndInsertIGDViewerThreadQuery": {
+		DocID:        "27257464393915989",
+		FriendlyName: "IGDSlideAsyncFetchAndInsertIGDViewerThreadQuery",
+	},
+	"IGDirectReactionSendMutation": {
+		DocID:        "24374451552236906",
+		FriendlyName: "IGDirectReactionSendMutation",
+	},
+	"IGDirectTextSendMutation": {
+		DocID:        "26911679871773184",
+		FriendlyName: "IGDirectTextSendMutation",
+	},
+	"IGDirectMediaSendMutation": {
+		DocID:        "25766288509716264",
+		FriendlyName: "IGDirectMediaSendMutation",
+	},
+	"IGDirectEditMessageMutation": {
+		DocID:        "32480262318254796",
+		FriendlyName: "IGDirectEditMessageMutation",
+	},
+	"IGDMessageListOffMsysQuery": {
+		DocID:        "27502152406082940",
+		FriendlyName: "IGDMessageListOffMsysQuery",
+	},
+	"IGDMessageUnsendDialogOffMsysMutation": {
+		DocID:        "26948700068153789",
+		FriendlyName: "IGDMessageUnsendDialogOffMsysMutation",
+	},
+	"IGDRemoveFromGroupDialogItemOffMsysMutation": {
+		DocID:        "26749775594683932",
+		FriendlyName: "IGDRemoveFromGroupDialogItemOffMsysMutation",
+	},
+	"IGDAddAdminDialogItemOffMsysMutation": {
+		DocID:        "35563011113312213",
+		FriendlyName: "IGDAddAdminDialogItemOffMsysMutation",
+	},
+	"IGDRemoveAdminDialogItemOffMsysMutation": {
+		DocID:        "26688907887428172",
+		FriendlyName: "IGDRemoveAdminDialogItemOffMsysMutation",
+	},
+	"IGDInboxInfoDeleteThreadDialogOffMsysMutation": {
+		DocID:        "35352443081068612",
+		FriendlyName: "IGDInboxInfoDeleteThreadDialogOffMsysMutation",
+	},
+	"useIGDMarkThreadAsReadMutation": {
+		DocID:        "27356881703909995",
+		FriendlyName: "useIGDMarkThreadAsReadMutation",
+	},
+	"useIGDMarkThreadAsReadValidationMutation": {
+		DocID:        "35211594988486314",
+		FriendlyName: "useIGDMarkThreadAsReadValidationMutation",
+	},
+	"PolarisProfilePageContentQuery": {
+		DocID:        "26672929172408668",
+		FriendlyName: "PolarisProfilePageContentQuery",
+	},
+	"IGDInboxInfoMuteToggleOffMsysMutation": {
+		DocID:        "26360506043651125",
+		FriendlyName: "IGDInboxInfoMuteToggleOffMsysMutation",
+	},
+	"useIGDPinThreadMutation": {
+		DocID:        "26491513390471063",
+		FriendlyName: "useIGDPinThreadMutation",
+	},
+	"useIGDPinMessageOffMsysMutation": {
+		DocID:        "27027218840244998",
+		FriendlyName: "useIGDPinMessageOffMsysMutation",
+	},
+	"useIGDUnpinMessageOffMsysMutation": {
+		DocID:        "26919110827778778",
+		FriendlyName: "useIGDUnpinMessageOffMsysMutation",
+	},
+	"IGDThreadListOffMsysPaginationQuery": {
+		DocID:        "27712934271665380",
+		FriendlyName: "IGDThreadListOffMsysPaginationQuery",
 	},
 }
 
@@ -103,15 +181,4 @@ type LSPlatformGraphQLLightspeedVariables struct {
 	SyncParams        interface{} `json:"sync_params,omitempty"`
 	LastAppliedCursor any         `json:"last_applied_cursor"`
 	Version           int64       `json:"version,omitempty"`
-}
-
-type SyncParams struct {
-	FullHeight                int    `json:"full_height,omitempty"`
-	Locale                    string `json:"locale,omitempty"`
-	PreviewHeight             int    `json:"preview_height,omitempty"`
-	PreviewHeightLarge        int    `json:"preview_height_large,omitempty"`
-	PreviewWidth              int    `json:"preview_width,omitempty"`
-	PreviewWidthLarge         int    `json:"preview_width_large,omitempty"`
-	Scale                     int    `json:"scale,omitempty"`
-	SnapshotNumThreadsPerPage int    `json:"snapshot_num_threads_per_page,omitempty"`
 }

@@ -46,12 +46,14 @@ import (
 	"maunium.net/go/mautrix/event"
 
 	"go.mau.fi/mautrix-meta/pkg/metaid"
+	"go.mau.fi/mautrix-meta/pkg/msgconv/mediadl"
 )
 
-func (mc *MessageConverter) TextToWhatsApp(content *event.MessageEventContent) *waCommon.MessageText {
-	// TODO mentions
+func (mc *MessageConverter) TextToWhatsApp(ctx context.Context, portal *bridgev2.Portal, content *event.MessageEventContent) *waCommon.MessageText {
+	text, mentions := mc.HTMLParser.ParseWhatsApp(ctx, content, portal)
 	return &waCommon.MessageText{
-		Text: proto.String(content.Body),
+		Text:         &text,
+		MentionedJID: mentions,
 	}
 }
 
@@ -64,8 +66,8 @@ func (mc *MessageConverter) ToWhatsApp(
 	relaybotFormatted bool,
 	replyTo *database.Message,
 ) (armadillo.RealMessageApplicationSub, *waMsgApplication.MessageApplication_Metadata, error) {
-	ctx = context.WithValue(ctx, contextKeyWAClient, client)
-	ctx = context.WithValue(ctx, contextKeyPortal, portal)
+	ctx = context.WithValue(ctx, mediadl.ContextKeyWAClient, client)
+	ctx = context.WithValue(ctx, mediadl.ContextKeyPortal, portal)
 
 	if evt.Type == event.EventSticker {
 		content.MsgType = event.MessageType(event.EventSticker.Type)
@@ -81,7 +83,7 @@ func (mc *MessageConverter) ToWhatsApp(
 	switch content.MsgType {
 	case event.MsgText, event.MsgNotice, event.MsgEmote:
 		waContent.Content = &waConsumerApplication.ConsumerApplication_Content_MessageText{
-			MessageText: mc.TextToWhatsApp(content),
+			MessageText: mc.TextToWhatsApp(ctx, portal, content),
 		}
 	case event.MsgImage, event.MsgVideo, event.MsgAudio, event.MsgFile, event.MessageType(event.EventSticker.Type):
 		reuploaded, fileName, err := mc.reuploadMediaToWhatsApp(ctx, evt, content)
@@ -90,7 +92,7 @@ func (mc *MessageConverter) ToWhatsApp(
 		}
 		var caption *waCommon.MessageText
 		if content.FileName != "" && content.Body != content.FileName {
-			caption = mc.TextToWhatsApp(content)
+			caption = mc.TextToWhatsApp(ctx, portal, content)
 		} else {
 			caption = &waCommon.MessageText{}
 		}
@@ -276,7 +278,7 @@ func (mc *MessageConverter) reuploadMediaToWhatsApp(ctx context.Context, evt *ev
 		content.Info.MauGIF = true
 	}
 	mediaType := msgToMediaType(content.MsgType)
-	client := ctx.Value(contextKeyWAClient).(*whatsmeow.Client)
+	client := ctx.Value(mediadl.ContextKeyWAClient).(*whatsmeow.Client)
 	uploaded, err := client.Upload(ctx, data, mediaType)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %w", bridgev2.ErrMediaReuploadFailed, err)

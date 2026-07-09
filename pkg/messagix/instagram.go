@@ -14,13 +14,13 @@ import (
 	"time"
 
 	"github.com/google/go-querystring/query"
-	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
-	"go.mau.fi/mautrix-meta/pkg/messagix/data/responses"
 	"go.mau.fi/mautrix-meta/pkg/messagix/graphql"
+	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/methods"
+	"go.mau.fi/mautrix-meta/pkg/messagix/responses"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/mautrix-meta/pkg/messagix/useragent"
@@ -36,12 +36,12 @@ type InstagramMethods struct {
 }
 
 func (ig *InstagramMethods) FetchProfile(ctx context.Context, username string) (*responses.ProfileInfoResponse, error) {
-	h := ig.client.buildHeaders(true, false)
+	h := ig.client.http.BuildHeaders(true, false)
 	h.Set("x-requested-with", "XMLHttpRequest")
 	h.Set("referer", ig.client.GetEndpoint("base_url")+username+"/")
 	reqUrl := ig.client.GetEndpoint("web_profile_info") + "username=" + username
 
-	resp, respBody, err := ig.client.MakeRequest(ctx, reqUrl, "GET", h, nil, types.NONE)
+	resp, respBody, err := ig.client.http.MakeRequest(ctx, reqUrl, "GET", h, nil, types.NONE)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch the profile by username @%s: %w", username, err)
 	}
@@ -58,7 +58,7 @@ func (ig *InstagramMethods) FetchProfile(ctx context.Context, username string) (
 }
 
 func (ig *InstagramMethods) FetchMedia(ctx context.Context, mediaID, mediaShortcode string) (*responses.FetchMediaResponse, error) {
-	h := ig.client.buildHeaders(true, false)
+	h := ig.client.http.BuildHeaders(true, false)
 	h.Set("x-requested-with", "XMLHttpRequest")
 	referer := ig.client.GetEndpoint("base_url")
 	if mediaShortcode != "" {
@@ -68,7 +68,7 @@ func (ig *InstagramMethods) FetchMedia(ctx context.Context, mediaID, mediaShortc
 	h.Set("Accept", "*/*")
 	reqUrl := fmt.Sprintf(ig.client.GetEndpoint("media_info"), mediaID)
 
-	resp, respBody, err := ig.client.MakeRequest(ctx, reqUrl, "GET", h, nil, types.NONE)
+	resp, respBody, err := ig.client.http.MakeRequest(ctx, reqUrl, "GET", h, nil, types.NONE)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch the media by id %s: %w", mediaID, err)
 	}
@@ -85,7 +85,7 @@ func (ig *InstagramMethods) FetchMedia(ctx context.Context, mediaID, mediaShortc
 }
 
 func (ig *InstagramMethods) FetchReel(ctx context.Context, reelIDs []string, mediaID string) (*responses.ReelInfoResponse, error) {
-	h := ig.client.buildHeaders(true, false)
+	h := ig.client.http.BuildHeaders(true, false)
 	h.Set("x-requested-with", "XMLHttpRequest")
 	h.Set("referer", ig.client.GetEndpoint("base_url"))
 	h.Set("Accept", "*/*")
@@ -98,7 +98,7 @@ func (ig *InstagramMethods) FetchReel(ctx context.Context, reelIDs []string, med
 	}
 
 	reqUrl := ig.client.GetEndpoint("reels_media") + query.Encode()
-	resp, respBody, err := ig.client.MakeRequest(ctx, reqUrl, "GET", h, nil, types.NONE)
+	resp, respBody, err := ig.client.http.MakeRequest(ctx, reqUrl, "GET", h, nil, types.NONE)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch reels by ids %v: %w", reelIDs, err)
 	}
@@ -130,9 +130,8 @@ func (ig *InstagramMethods) RegisterPushNotifications(ctx context.Context, endpo
 		return err
 	}
 
-	u := uuid.New()
-	payload := c.newHTTPQuery()
-	payload.Mid = u.String()
+	payload := c.http.NewHTTPQuery()
+	payload.Mid = ig.client.GetCookies().Get(cookies.IGCookieMachineID)
 	payload.DeviceType = "web_vapid"
 	payload.DeviceToken = endpoint
 	payload.SubscriptionKeys = string(jsonKeys)
@@ -144,19 +143,15 @@ func (ig *InstagramMethods) RegisterPushNotifications(ctx context.Context, endpo
 
 	payloadBytes := []byte(form.Encode())
 
-	headers := c.buildHeaders(true, false)
+	headers := c.http.BuildHeaders(true, false)
 	headers.Set("x-requested-with", "XMLHttpRequest")
 	headers.Set("Referer", c.GetEndpoint("base_url"))
 	headers.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 
 	url := c.GetEndpoint("web_push")
-	resp, body, err := c.MakeRequest(ctx, url, "POST", headers, payloadBytes, types.FORM)
+	_, body, err := c.http.MakeRequest(ctx, url, "POST", headers, payloadBytes, types.FORM)
 	if err != nil {
 		return err
-	}
-
-	if resp.StatusCode >= 300 || resp.StatusCode < 200 {
-		return fmt.Errorf("bad status code: %d", resp.StatusCode)
 	}
 
 	resBody := &struct {
@@ -206,7 +201,7 @@ func (ig *InstagramMethods) ExtractFBID(currentUser types.UserInfo, tbl *table.L
 }
 
 func (ig *InstagramMethods) fetchRouteDefinition(ctx context.Context, threadID string) (id string, err error) {
-	payload := ig.client.newHTTPQuery()
+	payload := ig.client.http.NewHTTPQuery()
 	payload.ClientPreviousActorID = "17841477657023246"
 	payload.RouteURL = fmt.Sprintf("/direct/t/%s/", threadID)
 	if ig.client.configs.RoutingNamespace == "" {
@@ -222,7 +217,7 @@ func (ig *InstagramMethods) fetchRouteDefinition(ctx context.Context, threadID s
 	form.Add("trace_policy", "")
 	payloadBytes := []byte(form.Encode())
 
-	headers := ig.client.buildHeaders(true, false)
+	headers := ig.client.http.BuildHeaders(true, false)
 	headers.Set("accept", "*/*")
 	headers.Set("origin", ig.client.GetEndpoint("base_url"))
 	headers.Set("accept", "*/*")
@@ -233,7 +228,7 @@ func (ig *InstagramMethods) fetchRouteDefinition(ctx context.Context, threadID s
 	headers.Set("sec-fetch-site", "same-origin")
 
 	url := ig.client.GetEndpoint("route_definition")
-	resp, body, err := ig.client.MakeRequest(ctx, url, "POST", headers, payloadBytes, types.FORM)
+	resp, body, err := ig.client.http.MakeRequest(ctx, url, "POST", headers, payloadBytes, types.FORM)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch route definition for thread %s: %w", threadID, err)
 	}
@@ -247,7 +242,7 @@ func (ig *InstagramMethods) fetchRouteDefinition(ctx context.Context, threadID s
 		return "", fmt.Errorf("invalid route definition response for thread %s", threadID)
 	}
 
-	responseBody := bytes.TrimPrefix(parts[0], antiJSPrefix)
+	responseBody := bytes.TrimPrefix(parts[0], httpclient.AntiJSPrefix)
 
 	var routeDefResp fetchRouteDefinitionResponse
 	err = json.Unmarshal(responseBody, &routeDefResp)
@@ -285,7 +280,7 @@ func (ig *InstagramMethods) DeleteThread(ctx context.Context, threadID string) e
 		ThreadID:                       id,
 		ShouldMoveFutureRequestsToSpam: false,
 	}
-	resp, _, err := ig.client.makeGraphQLRequest(ctx, "IGDeleteThread", &igVariables)
+	resp, _, err := ig.client.http.MakeGraphQLRequest(ctx, "IGDInboxInfoDeleteThreadDialogOffMsysMutation", &igVariables)
 	if err != nil {
 		return fmt.Errorf("failed to delete thread %s: %w", threadID, err)
 	}
@@ -317,7 +312,7 @@ func (ig *InstagramMethods) EditGroupTitle(ctx context.Context, threadID, newTit
 		ThreadID: threadID,
 		NewTitle: newTitle,
 	}
-	resp, _, err := ig.client.makeGraphQLRequest(ctx, "IGEditGroupTitle", &igVariables)
+	resp, _, err := ig.client.http.MakeGraphQLRequest(ctx, "IGDEditThreadNameDialogOffMsysMutation", &igVariables)
 	if err != nil {
 		return fmt.Errorf("failed to edit group title for thread %s: %w", threadID, err)
 	}
@@ -337,7 +332,7 @@ func (ig *InstagramMethods) AcceptMessageRequest(ctx context.Context, threadID s
 		IGInboxFolder:      nil,
 		OfflineThreadingID: strconv.FormatInt(methods.GenerateEpochID(), 10),
 	}
-	resp, respBody, err := ig.client.makeGraphQLRequest(ctx, "IGAcceptMessageRequest", &igVariables)
+	resp, respBody, err := ig.client.http.MakeGraphQLRequest(ctx, "useIGDirectAcceptMessageRequestMutation", &igVariables)
 	if err != nil {
 		return fmt.Errorf("failed to accept message request for thread %s: %w", threadID, err)
 	}
@@ -390,12 +385,12 @@ func (ig *InstagramMethods) EditGroupAvatar(ctx context.Context, threadID string
 	h.Set("offset", "0")
 	h.Set("priority", "u=6, i")
 
-	_, respBody, err := ig.client.MakeRequest(ctx, reqUrl, "POST", h, avatar, types.NONE)
+	_, respBody, err := ig.client.http.MakeRequest(ctx, reqUrl, "POST", h, avatar, types.NONE)
 	if err != nil {
 		return fmt.Errorf("failed to upload group avatar: %w", err)
 	}
 
-	var uploadResp RUploadResponse
+	var uploadResp httpclient.RUploadResponse
 	err = json.Unmarshal(respBody, &uploadResp)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal upload response: %w", err)
@@ -410,7 +405,7 @@ func (ig *InstagramMethods) EditGroupAvatar(ctx context.Context, threadID string
 		AttachmentFBID:     strconv.FormatInt(uploadResp.MediaID, 10),
 	}
 
-	_, err = ig.makeIGraphQLRequest(ctx, "IGUpdateGroupAvatar", "xig_direct_update_thread_image", igVariables)
+	_, err = ig.makeIGraphQLRequest(ctx, "IGDirectUpdateThreadImageMutation", "xig_direct_update_thread_image", igVariables)
 	if err != nil {
 		return fmt.Errorf("failed to set group avatar: %w", err)
 	}
@@ -445,7 +440,7 @@ func (ig *InstagramMethods) FetchMessageRequests(ctx context.Context) ([]*table.
 		IGDMaxUnreadMessagesCountRelayProvider:       5,
 		IGDThreadListActionsEnabledGKRelayProvider:   true,
 	}
-	resp, respBody, err := ig.client.makeGraphQLRequest(ctx, "IGListMessageRequests", variables)
+	resp, respBody, err := ig.client.http.MakeGraphQLRequest(ctx, "PolarisDirectMessageRequestQuery", variables)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch instagram message requests: %w", err)
 	}
@@ -487,7 +482,7 @@ func (ig *InstagramMethods) RemoveGroupAvatar(ctx context.Context, threadID stri
 		OfflineThreadingID: strconv.FormatInt(methods.GenerateEpochID(), 10),
 	}
 
-	_, err := ig.makeIGraphQLRequest(ctx, "IGRemoveGroupAvatar", "xig_direct_remove_thread_image", igVariables)
+	_, err := ig.makeIGraphQLRequest(ctx, "IGDirectRemoveThreadImageMutation", "xig_direct_remove_thread_image", igVariables)
 	if err != nil {
 		return fmt.Errorf("failed to remove group avatar: %w", err)
 	}
@@ -497,7 +492,7 @@ func (ig *InstagramMethods) RemoveGroupAvatar(ctx context.Context, threadID stri
 
 func (ig *InstagramMethods) buildAndroidHeaders() http.Header {
 	h := http.Header{}
-	h.Set("authorization", ig.client.GetRUploadToken())
+	h.Set("authorization", ig.client.GetHTTP().GetRUploadToken())
 	h.Set("user-agent", useragent.AndroidUserAgent)
 	h.Set("ig-intended-user-id", strconv.FormatInt(ig.client.cookies.GetUserID(), 10))
 	h.Set("ig-u-ds-user-id", strconv.FormatInt(ig.client.cookies.GetUserID(), 10))
@@ -526,7 +521,7 @@ func (ig *InstagramMethods) makeIGraphQLRequest(ctx context.Context, docName, ro
 		return nil, err
 	}
 
-	payload := &HttpQuery{
+	payload := &httpclient.HTTPQuery{
 		Method:                           "post",
 		Pretty:                           "false",
 		Format:                           "json",
@@ -546,7 +541,7 @@ func (ig *InstagramMethods) makeIGraphQLRequest(ctx context.Context, docName, ro
 	}
 	payloadBytes := []byte(form.Encode())
 
-	resp, respBody, err := ig.client.MakeRequest(ctx, graphQLUrl, "POST", h, payloadBytes, types.FORM)
+	resp, respBody, err := ig.client.http.MakeRequest(ctx, graphQLUrl, "POST", h, payloadBytes, types.FORM)
 	if err != nil {
 		return nil, err
 	}
