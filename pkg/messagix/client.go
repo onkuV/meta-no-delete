@@ -2,14 +2,9 @@ package messagix
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"net/http"
-	"net/url"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,12 +14,10 @@ import (
 	"go.mau.fi/util/exsync"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
-	"golang.org/x/net/proxy"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
-	"go.mau.fi/mautrix-meta/pkg/messagix/crypto"
-	"go.mau.fi/mautrix-meta/pkg/messagix/data/endpoints"
-	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
+	"go.mau.fi/mautrix-meta/pkg/messagix/endpoints"
+	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
@@ -41,33 +34,26 @@ type Config struct {
 }
 
 type Client struct {
+	http *httpclient.HTTPClient
+
 	Instagram     *InstagramMethods
 	Facebook      *FacebookMethods
 	MessengerLite *MessengerLiteMethods
 	Logger        zerolog.Logger
 	Platform      types.Platform
 
-	http         *http.Client
-	httpSettings exhttp.ClientSettings
-	proxyAddr    string
 	socket       *Socket
-	dgwSocket    *dgw.Socket
 	eventHandler EventHandler
-	configs      *Configs
+	configs      *httpclient.Configs
 	syncManager  *SyncManager
 
 	cookies         *cookies.Cookies
-	httpProxy       func(*http.Request) (*url.URL, error)
-	socksProxy      proxy.Dialer
-	GetNewProxy     func(reason string) (string, error)
 	mayConnectToDGW bool
 
 	device *store.Device
 
-	lsRequests      int
-	graphQLRequests int
-	endpoints       map[string]string
-	nextTaskID      atomic.Int64
+	endpoints  map[string]string
+	nextTaskID atomic.Int64
 
 	catRefreshLock         sync.Mutex
 	unnecessaryCATRequests int
@@ -75,11 +61,8 @@ type Client struct {
 	stopCurrentConnections atomic.Pointer[context.CancelFunc]
 	connectionLoopStopped  *exsync.Event
 	canSendMessages        *exsync.Event
-
-	logRedactedBloksPayloads bool
 }
 
-var DisableTLSVerification = false
 var MaxConnectBackoff = 5 * time.Minute
 
 func NewClient(cookies *cookies.Cookies, logger zerolog.Logger, cfg *Config) *Client {
@@ -87,32 +70,19 @@ func NewClient(cookies *cookies.Cookies, logger zerolog.Logger, cfg *Config) *Cl
 		panic("messagix: platform must be set in cookies")
 	}
 	cli := &Client{
-		cookies:                  cookies,
-		Logger:                   logger,
-		lsRequests:               0,
-		graphQLRequests:          1,
-		Platform:                 cookies.Platform,
-		connectionLoopStopped:    exsync.NewEvent(),
-		canSendMessages:          exsync.NewEvent(),
-		logRedactedBloksPayloads: cfg.LogRedactedBloksPayloads,
+		cookies:               cookies,
+		Logger:                logger,
+		Platform:              cookies.Platform,
+		connectionLoopStopped: exsync.NewEvent(),
+		canSendMessages:       exsync.NewEvent(),
 	}
+	cli.configs = httpclient.NewConfigs(cli)
+	cli.http = httpclient.NewHTTPClient(cli, cli.configs, cfg.ClientSettings)
+	cli.http.LogRedactedBloksPayloads = cfg.LogRedactedBloksPayloads
 	cli.nextTaskID.Store(-1) // start from 0
-	cli.SetHTTP(cfg.ClientSettings)
 	cli.connectionLoopStopped.Set()
-	if DisableTLSVerification {
-		cli.http.Transport.(*http.Transport).TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: true,
-		}
-	}
-	cli.http.CheckRedirect = cli.checkHTTPRedirect
 
 	cli.configurePlatformClient()
-	cli.configs = &Configs{
-		client:             cli,
-		BrowserConfigTable: &types.SchedulerJSDefineConfig{},
-		Bitmap:             crypto.NewBitmap(),
-		CSRBitmap:          crypto.NewBitmap(),
-	}
 	cli.socket = cli.newSocketClient()
 	cli.mayConnectToDGW = cfg.MayConnectToDGW
 
@@ -120,11 +90,21 @@ func NewClient(cookies *cookies.Cookies, logger zerolog.Logger, cfg *Config) *Cl
 }
 
 func (c *Client) GetCookies() *cookies.Cookies {
+	if c == nil {
+		return nil
+	}
 	return c.cookies
 }
 
+func (c *Client) GetHTTP() *httpclient.HTTPClient {
+	if c == nil {
+		return nil
+	}
+	return c.http
+}
+
 type dumpedState struct {
-	Configs     *Configs
+	Configs     *httpclient.Configs
 	SyncStore   map[int64]*socket.QueryMetadata
 	PacketsSent uint16
 	SessionID   int64
@@ -178,17 +158,17 @@ func (c *Client) LoadMessagesPage(ctx context.Context) (types.UserInfo, *table.L
 	if c == nil {
 		return nil, nil, ErrClientIsNil
 	} else if !c.cookies.IsLoggedIn() {
-		return nil, nil, ErrTokenInvalidated
+		return nil, nil, httpclient.ErrTokenInvalidated
 	}
 
-	moduleLoader := &ModuleParser{client: c, LS: &table.LSTable{}}
+	moduleLoader := httpclient.NewModuleParser(c, c.http, c.configs)
 	err := moduleLoader.Load(ctx, c.GetEndpoint("messages"))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to load inbox: %w", err)
 	}
 
 	c.syncManager = c.newSyncManager()
-	ls, err := c.configs.SetupConfigs(ctx, moduleLoader.LS)
+	ls, err := c.setupConfigs(ctx, moduleLoader.LS)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -232,34 +212,6 @@ func (c *Client) configurePlatformClient() {
 	c.endpoints = selectedEndpoints
 }
 
-func (c *Client) SetProxy(proxyAddr string) error {
-	if c == nil {
-		return ErrClientIsNil
-	}
-	proxyParsed, err := url.Parse(proxyAddr)
-	if err != nil {
-		return err
-	}
-
-	if proxyParsed.Scheme == "http" || proxyParsed.Scheme == "https" {
-		c.httpProxy = http.ProxyURL(proxyParsed)
-		c.proxyAddr = proxyAddr
-	} else if proxyParsed.Scheme == "socks5" {
-		c.socksProxy, err = proxy.FromURL(proxyParsed, &net.Dialer{Timeout: 20 * time.Second})
-		if err != nil {
-			return err
-		}
-		c.proxyAddr = proxyAddr
-	}
-	c.SetHTTP(c.httpSettings)
-
-	c.Logger.Debug().
-		Str("scheme", proxyParsed.Scheme).
-		Str("host", proxyParsed.Host).
-		Msg("Using proxy")
-	return nil
-}
-
 func (c *Client) SetEventHandler(handler EventHandler) {
 	if c == nil {
 		return
@@ -271,38 +223,6 @@ func (c *Client) HandleEvent(ctx context.Context, evt any) {
 	if c.eventHandler != nil {
 		c.eventHandler(ctx, evt)
 	}
-}
-
-func (c *Client) SetHTTP(settings exhttp.ClientSettings) {
-	if c == nil {
-		return
-	}
-	c.httpSettings = settings.
-		WithGlobalTimeout(60 * time.Second).
-		WithResponseHeaderTimeout(20 * time.Second)
-	if c.proxyAddr != "" {
-		c.httpSettings, _ = c.httpSettings.WithProxy(c.proxyAddr)
-	}
-	oldHTTP := c.http
-	c.http = c.httpSettings.Compile()
-	c.http.CheckRedirect = c.checkHTTPRedirect
-	if oldHTTP != nil {
-		oldHTTP.CloseIdleConnections()
-	}
-}
-
-func (c *Client) UpdateProxy(reason string) bool {
-	if c == nil || c.GetNewProxy == nil {
-		return true
-	}
-	if proxyAddr, err := c.GetNewProxy(reason); err != nil {
-		c.Logger.Err(err).Str("reason", reason).Msg("Failed to get new proxy")
-		return false
-	} else if err = c.SetProxy(proxyAddr); err != nil {
-		c.Logger.Err(err).Str("reason", reason).Msg("Failed to set new proxy")
-		return false
-	}
-	return true
 }
 
 func (c *Client) Connect(ctx context.Context) error {
@@ -373,54 +293,9 @@ func (c *Client) Connect(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			}
-			c.UpdateProxy("reconnect")
+			c.http.UpdateProxy("reconnect")
 		}
 	}()
-	if c.Platform == types.Instagram && c.mayConnectToDGW {
-		go c.connectDGW(ctx)
-	}
-	return nil
-}
-
-func (c *Client) connectDGW(ctx context.Context) error {
-	reconnectIn := 2 * time.Second
-	for {
-		connectStart := time.Now()
-		err := c.connectDGWOnce(ctx)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if time.Since(connectStart) > 2*time.Minute {
-			reconnectIn = 2 * time.Second
-		} else {
-			reconnectIn *= 2
-			if reconnectIn > MaxConnectBackoff {
-				reconnectIn = MaxConnectBackoff
-			}
-		}
-		if err != nil {
-			c.Logger.Err(err).Dur("reconnect_in", reconnectIn).Msg("Error in DGW connection, reconnecting")
-		} else {
-			c.Logger.Warn().Dur("reconnect_in", reconnectIn).Msg("DGW connection closed without error, reconnecting")
-		}
-		select {
-		case <-time.After(reconnectIn):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
-func (c *Client) connectDGWOnce(ctx context.Context) error {
-	c.dgwSocket = dgw.NewSocketClient(c)
-	err := c.dgwSocket.CanConnect()
-	if err != nil {
-		return err
-	}
-	err = c.dgwSocket.Connect(ctx)
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -432,9 +307,6 @@ func (c *Client) Disconnect() {
 		(*fn)()
 	}
 	c.socket.Disconnect()
-	if c.dgwSocket != nil {
-		c.dgwSocket.Disconnect()
-	}
 	if !c.connectionLoopStopped.WaitTimeout(5 * time.Second) {
 		c.Logger.Warn().Msg("Connection loop didn't stop in time")
 	}
@@ -449,10 +321,6 @@ func (c *Client) GetEndpoint(name string) string {
 		return endpoint
 	}
 	panic(fmt.Sprintf("messagix-client: endpoint %s not found", name))
-}
-
-func (c *Client) getEndpointForThreadID(threadID int64) string {
-	return c.GetEndpoint("thread") + strconv.FormatInt(threadID, 10) + "/"
 }
 
 func (c *Client) IsAuthenticated() bool {
@@ -513,7 +381,6 @@ func (c *Client) ForceReconnect() {
 		return
 	}
 	c.socket.Disconnect()
-	c.dgwSocket.Disconnect()
 }
 
 func (c *Client) FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error) {

@@ -21,7 +21,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"go.mau.fi/mautrix-meta/pkg/messagix"
+	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/methods"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
@@ -117,12 +117,12 @@ func (m *MetaClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matr
 				ctx, m.Client, msg.Event, msg.Content, msg.ReplyTo, msg.ThreadRoot, otid, msg.OrigSender != nil, msg.Portal,
 			)
 		}
-		if errors.Is(err, messagix.ErrTokenInvalidated) {
+		if errors.Is(err, httpclient.ErrTokenInvalidated) {
 			if m.canReconnect() {
 				go m.FullReconnect()
 			}
 			return nil, err
-		} else if errors.Is(err, messagix.ErrConsentRequired) {
+		} else if errors.Is(err, httpclient.ErrConsentRequired) {
 			code := IGConsentRequired
 			if m.LoginMeta.Platform.IsMessenger() {
 				code = FBConsentRequired
@@ -458,7 +458,7 @@ func (m *MetaClient) HandleMatrixEdit(ctx context.Context, edit *bridgev2.Matrix
 		}
 		consumerMsg := wrapEdit(&waConsumerApplication.ConsumerApplication_EditMessage{
 			Key:         m.messageIDToWAKey(messageID),
-			Message:     m.Main.MsgConv.TextToWhatsApp(edit.Content),
+			Message:     m.Main.MsgConv.TextToWhatsApp(ctx, edit.Portal, edit.Content),
 			TimestampMS: ptr.Ptr(edit.Event.Timestamp),
 		})
 		edit.EditTarget.Metadata.(*metaid.MessageMetadata).EditTimestamp = edit.Event.Timestamp
@@ -784,7 +784,7 @@ func (m *MetaClient) HandleMatrixRoomAvatar(ctx context.Context, msg *bridgev2.M
 			return false, fmt.Errorf("failed to download avatar: %w", err)
 		}
 		mimeType := http.DetectContentType(data)
-		resp, err := m.Client.SendMercuryUploadRequest(ctx, threadID, &messagix.MercuryUploadMedia{
+		resp, err := m.Client.GetHTTP().SendMercuryUploadRequest(ctx, threadID, &httpclient.MercuryUploadMedia{
 			Filename:  "avatar.jpg",
 			MimeType:  mimeType,
 			MediaData: data,

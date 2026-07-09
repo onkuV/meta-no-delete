@@ -10,16 +10,18 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/jsontime"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/mediaproxy"
 
-	"go.mau.fi/mautrix-meta/pkg/messagix/data/responses"
+	"go.mau.fi/mautrix-meta/pkg/messagix/responses"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
 	"go.mau.fi/mautrix-meta/pkg/msgconv"
+	"go.mau.fi/mautrix-meta/pkg/msgconv/mediadl"
 )
 
 var _ bridgev2.DirectMediableNetwork = (*MetaConnector)(nil)
@@ -54,7 +56,7 @@ func (m *MetaConnector) Download(ctx context.Context, mediaID networkid.MediaID,
 
 	switch mediaInfo.Type {
 	case metaid.DirectMediaTypeMetaV1, metaid.DirectMediaTypeMetaV2:
-		var info *msgconv.DirectMediaMeta
+		var info *mediadl.DirectMediaMeta
 		err = json.Unmarshal(dmm, &info)
 		if err != nil {
 			return nil, err
@@ -64,13 +66,13 @@ func (m *MetaConnector) Download(ctx context.Context, mediaID networkid.MediaID,
 		url := info.URL
 
 		// Check if URL is expired or about to expire (5 minute buffer)
-		needsRefresh := info.ExpiresAt > 0 && time.Now().UnixMilli() > info.ExpiresAt-5*60*1000
+		needsRefresh := !info.ExpiresAt.IsZero() && time.Now().After(info.ExpiresAt.Add(-5*time.Minute))
 
 		// Try download first
-		size, reader, err := msgconv.DownloadMedia(ctx, info.MimeType, url, m.MsgConv.MaxFileSize)
+		size, reader, err := mediadl.DownloadMedia(ctx, info.MimeType, url, m.MsgConv.MaxFileSize)
 
 		// If download failed with 403 or we know URL is expired, try to refresh
-		if err != nil && (errors.Is(err, msgconv.ErrForbidden) || needsRefresh) {
+		if err != nil && (errors.Is(err, mediadl.ErrForbidden) || needsRefresh) {
 			log.Debug().
 				Bool("needs_refresh", needsRefresh).
 				AnErr("original_error", err).
@@ -84,7 +86,7 @@ func (m *MetaConnector) Download(ctx context.Context, mediaID networkid.MediaID,
 			}
 
 			log.Debug().Str("refreshed_url", refreshedURL).Msg("Successfully refreshed media URL")
-			size, reader, err = msgconv.DownloadMedia(ctx, info.MimeType, refreshedURL, m.MsgConv.MaxFileSize)
+			size, reader, err = mediadl.DownloadMedia(ctx, info.MimeType, refreshedURL, m.MsgConv.MaxFileSize)
 		}
 
 		if err != nil {
@@ -123,7 +125,7 @@ func (m *MetaConnector) refreshMediaURL(
 	ctx context.Context,
 	mediaInfo *metaid.MediaInfo,
 	msg *database.Message,
-	info *msgconv.DirectMediaMeta,
+	info *mediadl.DirectMediaMeta,
 ) (string, error) {
 	ul := m.Bridge.GetCachedUserLoginByID(mediaInfo.UserID)
 	if ul == nil || !ul.Client.IsLoggedIn() {
@@ -135,7 +137,7 @@ func (m *MetaConnector) refreshMediaURL(
 	if info.XMATargetID != 0 || info.XMAShortcode != "" || info.StoryMediaID != "" {
 		return m.refreshXMAMedia(ctx, client, info)
 	}
-	if info.AttachmentFbid != "" {
+	if info.AttachmentFBID != "" {
 		return m.refreshBlobMedia(ctx, client, msg, info)
 	}
 
@@ -146,7 +148,7 @@ func (m *MetaConnector) refreshMediaURL(
 func (m *MetaConnector) refreshXMAMedia(
 	ctx context.Context,
 	client *MetaClient,
-	info *msgconv.DirectMediaMeta,
+	info *mediadl.DirectMediaMeta,
 ) (string, error) {
 	ig := client.Client.Instagram
 	if ig == nil {
@@ -219,7 +221,7 @@ func (m *MetaConnector) refreshBlobMedia(
 	ctx context.Context,
 	client *MetaClient,
 	msg *database.Message,
-	info *msgconv.DirectMediaMeta,
+	info *mediadl.DirectMediaMeta,
 ) (string, error) {
 	log := zerolog.Ctx(ctx)
 
@@ -239,7 +241,7 @@ func (m *MetaConnector) refreshBlobMedia(
 	log.Debug().
 		Int64("thread_key", threadKey).
 		Str("message_id", fbMsgID.ID).
-		Str("attachment_fbid", info.AttachmentFbid).
+		Str("attachment_fbid", info.AttachmentFBID).
 		Int("part_index", info.PartIndex).
 		Msg("Refreshing blob media by re-fetching messages")
 
@@ -271,7 +273,7 @@ func (m *MetaConnector) refreshBlobMedia(
 	for _, wrappedMsg := range allMessages {
 		// Build attachment URL map: AttachmentFbid -> fresh URL
 		attachmentURLs := make(map[string]string)
-		attachmentExpiry := make(map[string]int64)
+		attachmentExpiry := make(map[string]time.Time)
 
 		for _, att := range wrappedMsg.BlobAttachments {
 			if att.AttachmentFbid == "" {
@@ -285,7 +287,7 @@ func (m *MetaConnector) refreshBlobMedia(
 			}
 			if url != "" {
 				attachmentURLs[att.AttachmentFbid] = url
-				attachmentExpiry[att.AttachmentFbid] = expiry
+				attachmentExpiry[att.AttachmentFbid] = time.UnixMilli(expiry)
 			}
 		}
 
@@ -301,7 +303,7 @@ func (m *MetaConnector) refreshBlobMedia(
 			}
 			if url != "" {
 				attachmentURLs[att.AttachmentFbid] = url
-				attachmentExpiry[att.AttachmentFbid] = expiry
+				attachmentExpiry[att.AttachmentFbid] = time.UnixMilli(expiry)
 			}
 		}
 
@@ -323,18 +325,18 @@ func (m *MetaConnector) refreshBlobMedia(
 				continue
 			}
 
-			var dmm msgconv.DirectMediaMeta
+			var dmm mediadl.DirectMediaMeta
 			if err := json.Unmarshal(meta.DirectMediaMeta, &dmm); err != nil {
 				continue
 			}
 
 			// Check if this attachment has a fresh URL
-			if dmm.AttachmentFbid == "" {
+			if dmm.AttachmentFBID == "" {
 				continue
 			}
 
-			freshURL, hasFreshURL := attachmentURLs[dmm.AttachmentFbid]
-			freshExpiry := attachmentExpiry[dmm.AttachmentFbid]
+			freshURL, hasFreshURL := attachmentURLs[dmm.AttachmentFBID]
+			freshExpiry := attachmentExpiry[dmm.AttachmentFBID]
 
 			if !hasFreshURL || freshURL == dmm.URL {
 				// No update needed
@@ -343,7 +345,7 @@ func (m *MetaConnector) refreshBlobMedia(
 
 			// Update the stored URL and expiry
 			dmm.URL = freshURL
-			dmm.ExpiresAt = freshExpiry
+			dmm.ExpiresAt = jsontime.UM(freshExpiry)
 
 			updatedMeta, err := json.Marshal(dmm)
 			if err != nil {
@@ -360,11 +362,11 @@ func (m *MetaConnector) refreshBlobMedia(
 			updatedCount++
 			log.Debug().
 				Str("message_id", wrappedMsg.MessageId).
-				Str("attachment_fbid", dmm.AttachmentFbid).
+				Str("attachment_fbid", dmm.AttachmentFBID).
 				Msg("Updated attachment URL in database")
 
 			// Check if this is the attachment we're looking for
-			if wrappedMsg.MessageId == fbMsgID.ID && dmm.AttachmentFbid == info.AttachmentFbid {
+			if wrappedMsg.MessageId == fbMsgID.ID && dmm.AttachmentFBID == info.AttachmentFBID {
 				resultURL = freshURL
 			}
 		}

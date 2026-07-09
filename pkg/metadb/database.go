@@ -27,6 +27,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
+	"go.mau.fi/util/exsync"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
@@ -34,6 +35,15 @@ type MetaDB struct {
 	*dbutil.Database
 
 	BridgeID networkid.BridgeID
+
+	igUserMap   *exsync.Map[string, int64]
+	igChatMap   *exsync.Map[keyWithLogin, int64]
+	igThreadMap *exsync.Map[keyWithLogin, int64]
+}
+
+type keyWithLogin struct {
+	IGID  string
+	Login networkid.UserLoginID
 }
 
 func New(bridgeID networkid.BridgeID, db *dbutil.Database, log zerolog.Logger) *MetaDB {
@@ -41,6 +51,10 @@ func New(bridgeID networkid.BridgeID, db *dbutil.Database, log zerolog.Logger) *
 	return &MetaDB{
 		BridgeID: bridgeID,
 		Database: db,
+
+		igUserMap:   exsync.NewMap[string, int64](),
+		igChatMap:   exsync.NewMap[keyWithLogin, int64](),
+		igThreadMap: exsync.NewMap[keyWithLogin, int64](),
 	}
 }
 
@@ -80,6 +94,28 @@ func (db *MetaDB) GetThreadByMessage(ctx context.Context, messageID string) (thr
 	return
 }
 
+func (db *MetaDB) GetIGSeqID(ctx context.Context, loginID networkid.UserLoginID) (int64, time.Time, error) {
+	var seqID, ts int64
+	err := db.QueryRow(ctx, "SELECT seq_id, timestamp FROM meta_instagram_seq_id WHERE bridge_id = $1 AND login_id = $2", db.BridgeID, loginID).Scan(&seqID, &ts)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = nil
+		}
+		return 0, time.Time{}, err
+	}
+	return seqID, time.UnixMilli(ts), nil
+}
+
+func (db *MetaDB) PutIGSeqID(ctx context.Context, loginID networkid.UserLoginID, seqID int64, ts time.Time) error {
+	_, err := db.Exec(ctx, `
+		INSERT INTO meta_instagram_seq_id (bridge_id, login_id, seq_id, timestamp)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (bridge_id, login_id) DO UPDATE SET seq_id = excluded.seq_id, timestamp = excluded.timestamp
+		WHERE meta_instagram_seq_id.seq_id <= excluded.seq_id
+	`, db.BridgeID, loginID, seqID, ts.UnixMilli())
+	return err
+}
+
 func (db *MetaDB) PutReconnectionState(ctx context.Context, loginID networkid.UserLoginID, state json.RawMessage) error {
 	_, err := db.Exec(ctx, `
 		INSERT INTO meta_reconnection_state (bridge_id, login_id, state)
@@ -92,6 +128,16 @@ func (db *MetaDB) PutReconnectionState(ctx context.Context, loginID networkid.Us
 func (db *MetaDB) DeleteReconnectionState(ctx context.Context, loginID networkid.UserLoginID) error {
 	_, err := db.Exec(ctx, `
 		DELETE FROM meta_reconnection_state WHERE bridge_id = $1 AND login_id = $2
+	`, db.BridgeID, loginID)
+	if err != nil {
+		return err
+	}
+	return db.DeleteIGSeqID(ctx, loginID)
+}
+
+func (db *MetaDB) DeleteIGSeqID(ctx context.Context, loginID networkid.UserLoginID) error {
+	_, err := db.Exec(ctx, `
+		DELETE FROM meta_instagram_seq_id WHERE bridge_id = $1 AND login_id = $2
 	`, db.BridgeID, loginID)
 	return err
 }
@@ -119,10 +165,17 @@ func (db *MetaDB) GetReconnectionState(ctx context.Context, loginID networkid.Us
 }
 
 func (db *MetaDB) GetFBIDForIGUser(ctx context.Context, igid string) (fbid int64, err error) {
+	var ok bool
+	fbid, ok = db.igUserMap.Get(igid)
+	if ok {
+		return fbid, nil
+	}
 	err = db.QueryRow(ctx, "SELECT fbid FROM meta_instagram_user_id WHERE igid = $1", igid).Scan(&fbid)
 	if errors.Is(err, sql.ErrNoRows) {
 		// return 0 if not cached
 		err = nil
+	} else {
+		db.igUserMap.Set(igid, fbid)
 	}
 	return
 }
@@ -136,16 +189,46 @@ func (db *MetaDB) GetIGUserForFBID(ctx context.Context, fbid int64) (igid string
 	return
 }
 
-func (db *MetaDB) GetFBIDForIGThread(ctx context.Context, igid string) (fbid int64, err error) {
-	err = db.QueryRow(ctx, "SELECT fbid FROM meta_instagram_thread_id WHERE igid = $1", igid).Scan(&fbid)
+func (db *MetaDB) GetFBIDForIGThread(ctx context.Context, igid string, login networkid.UserLoginID) (fbid int64, err error) {
+	var ok bool
+	fbid, ok = db.igThreadMap.Get(keyWithLogin{igid, login})
+	if ok {
+		return fbid, nil
+	}
+	err = db.QueryRow(ctx, "SELECT fbid FROM meta_instagram_thread_id WHERE igid = $1 AND login = $2", igid, login).Scan(&fbid)
 	if errors.Is(err, sql.ErrNoRows) {
 		// return 0 if not cached
 		err = nil
+	} else {
+		db.igThreadMap.Set(keyWithLogin{igid, login}, fbid)
+	}
+	return
+}
+
+func (db *MetaDB) GetFBIDForIGChat(ctx context.Context, igid string, login networkid.UserLoginID) (fbid int64, err error) {
+	var ok bool
+	fbid, ok = db.igChatMap.Get(keyWithLogin{igid, login})
+	if ok {
+		return fbid, nil
+	}
+	err = db.QueryRow(ctx, "SELECT fbid FROM meta_instagram_chat_id WHERE igid = $1 AND login = $2", igid, login).Scan(&fbid)
+	if errors.Is(err, sql.ErrNoRows) {
+		// return 0 if not cached
+		err = nil
+	} else {
+		db.igChatMap.Set(keyWithLogin{igid, login}, fbid)
 	}
 	return
 }
 
 func (db *MetaDB) PutFBIDForIGUser(ctx context.Context, igid string, fbid int64) error {
+	if igid == "" || igid == "0" || fbid == 0 {
+		return nil
+	}
+	_, exists := db.igUserMap.GetOrSet(igid, fbid)
+	if exists {
+		return nil
+	}
 	// If the fbid gets set to a new value for an existing row,
 	// that would be surprising. We don't currently expect these
 	// values ever to change.
@@ -153,7 +236,73 @@ func (db *MetaDB) PutFBIDForIGUser(ctx context.Context, igid string, fbid int64)
 	return err
 }
 
-func (db *MetaDB) PutFBIDForIGThread(ctx context.Context, igid string, fbid int64) error {
-	_, err := db.Exec(ctx, "INSERT INTO meta_instagram_thread_id (igid, fbid) VALUES ($1, $2) ON CONFLICT DO NOTHING", igid, fbid)
+func (db *MetaDB) PutFBIDForIGThread(ctx context.Context, igid string, fbid int64, login networkid.UserLoginID) error {
+	if igid == "" || igid == "0" || fbid == 0 {
+		return nil
+	}
+	_, exists := db.igThreadMap.GetOrSet(keyWithLogin{igid, login}, fbid)
+	if exists {
+		return nil
+	}
+	_, err := db.Exec(ctx, "INSERT INTO meta_instagram_thread_id (igid, fbid, login) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", igid, fbid, login)
 	return err
+}
+
+func (db *MetaDB) PutFBIDForIGChat(ctx context.Context, igid string, fbid int64, login networkid.UserLoginID) error {
+	if igid == "" || igid == "0" || fbid == 0 {
+		return nil
+	}
+	_, exists := db.igChatMap.GetOrSet(keyWithLogin{igid, login}, fbid)
+	if exists {
+		return nil
+	}
+	_, err := db.Exec(ctx, "INSERT INTO meta_instagram_chat_id (igid, fbid, login) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", igid, fbid, login)
+	return err
+}
+
+const (
+	putIGReactionQuery = `
+		INSERT INTO meta_instagram_reaction (bridge_id, portal_id, portal_receiver, target_message_id, reaction_sender, reaction_message_id)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT DO NOTHING
+	`
+	getIGReactionQuery = `
+		SELECT target_message_id, reaction_sender
+		FROM meta_instagram_reaction
+		WHERE bridge_id = $1 AND portal_id = $2 AND portal_receiver = $3 AND reaction_message_id = $4
+	`
+)
+
+func (db *MetaDB) PutIGReaction(ctx context.Context, portalKey networkid.PortalKey, targetMsgID string, sender int64, reactionMsgID string) error {
+	_, err := db.Exec(ctx, putIGReactionQuery, db.BridgeID, portalKey.ID, portalKey.Receiver, targetMsgID, sender, reactionMsgID)
+	return err
+}
+
+type IGReactionEntry struct {
+	TargetMsgID   string
+	Sender        int64
+	ReactionMsgID string
+}
+
+func (ire *IGReactionEntry) GetMassInsertValues() [3]any {
+	return [3]any{ire.TargetMsgID, ire.Sender, ire.ReactionMsgID}
+}
+
+var putIGReactionMassInsertBuilder = dbutil.NewMassInsertBuilder[*IGReactionEntry, [3]any](putIGReactionQuery, "($1, $2, $3, $%d, $%d, $%d)")
+
+func (db *MetaDB) PutManyIGReactions(ctx context.Context, portalKey networkid.PortalKey, reactions []*IGReactionEntry) error {
+	if len(reactions) == 0 {
+		return nil
+	}
+	query, values := putIGReactionMassInsertBuilder.Build([3]any{db.BridgeID, portalKey.ID, portalKey.Receiver}, reactions)
+	_, err := db.Exec(ctx, query, values...)
+	return err
+}
+
+func (db *MetaDB) GetIGReactionTarget(ctx context.Context, portalKey networkid.PortalKey, reactionMsgID string) (targetMsgID string, sender int64, err error) {
+	err = db.QueryRow(ctx, getIGReactionQuery, db.BridgeID, portalKey.ID, portalKey.Receiver, reactionMsgID).Scan(&targetMsgID, &sender)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+	}
+	return
 }
