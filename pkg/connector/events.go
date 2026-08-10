@@ -178,7 +178,7 @@ func (evt *FBMessageEvent) ConvertMessage(ctx context.Context, portal *bridgev2.
 	if cli == nil {
 		return nil, messagix.ErrClientIsNil
 	}
-	return evt.m.Main.MsgConv.ToMatrix(ctx, portal, cli, intent, evt.GetID(), evt.WrappedMessage, evt.m.Main.Config.DisableXMAAlways), nil
+	return evt.m.Main.MsgConv.ToMatrix(ctx, portal, cli, evt.m.UserLogin, intent, evt.GetID(), evt.WrappedMessage), nil
 }
 
 type FBEditEvent struct {
@@ -281,7 +281,7 @@ func (evt *EnsureWAChatStateEvent) GetChatInfo(ctx context.Context, portal *brid
 				ExtraUpdates: updateServerAndThreadType(evt.JID, table.ENCRYPTED_OVER_WA_ONE_TO_ONE),
 			}, nil
 		}
-		return evt.m.makeWADirectChatInfo(evt.JID), nil
+		return evt.m.makeWADirectChatInfo(ctx, evt.JID), nil
 	default:
 		return nil, fmt.Errorf("unknown WhatsApp server %s", evt.JID.Server)
 	}
@@ -511,7 +511,7 @@ func (evt *WAMessageEvent) ConvertMessage(ctx context.Context, portal *bridgev2.
 			Msg("Intercepted E2EE message delete attempt, sending notice instead.")
 		return makeDeleteNoticeMessage(deletedID, replyTo), nil
 	}
-	return evt.m.Main.MsgConv.WhatsAppToMatrix(ctx, portal, evt.m.Client, evt.m.E2EEClient, intent, evt.GetID(), evt.FBMessage), nil
+	return evt.m.Main.MsgConv.WhatsAppToMatrix(ctx, portal, evt.m.Client, evt.m.E2EEClient, evt.m.UserLogin, intent, evt.GetID(), evt.FBMessage), nil
 }
 
 // deleteNoticeInfo reports whether this event is an E2EE delete/revoke and, if

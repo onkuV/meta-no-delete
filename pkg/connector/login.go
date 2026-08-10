@@ -26,10 +26,10 @@ import (
 )
 
 const (
-	FlowIDFacebookCookies  = "facebook"
-	FlowIDMessengerCookies = "messenger"
-	FlowIDInstagramCookies = "instagram"
-	FlowIDMessengerLite    = "messenger-lite"
+	FlowIDFacebookCookies      = "facebook"
+	FlowIDMessengerCookies     = "messenger"
+	FlowIDMessengerLiteIOS     = "messenger-lite"
+	FlowIDMessengerLiteAndroid = "messenger-lite-android"
 
 	LoginStepIDCookies  = "fi.mau.meta.cookies"
 	LoginStepIDComplete = "fi.mau.meta.complete"
@@ -47,10 +47,15 @@ func (m *MetaConnector) CreateLogin(ctx context.Context, user *bridgev2.User, fl
 		}
 	case FlowIDMessengerCookies:
 		plat = types.Messenger
-	case FlowIDInstagramCookies:
-		plat = types.Instagram
-	case FlowIDMessengerLite:
-		plat = types.MessengerLite
+	case FlowIDMessengerLiteIOS:
+		plat = types.MessengerLiteIOS
+		return &MetaNativeLogin{
+			Mode: plat,
+			User: user,
+			Main: m,
+		}, nil
+	case FlowIDMessengerLiteAndroid:
+		plat = types.MessengerLiteAndroid
 		return &MetaNativeLogin{
 			Mode: plat,
 			User: user,
@@ -105,15 +110,15 @@ var (
 		Description: "Login using cookies from messenger.com",
 		ID:          FlowIDMessengerCookies,
 	}
-	loginFlowInstagram = bridgev2.LoginFlow{
-		Name:        "instagram.com",
-		Description: "Login using cookies from instagram.com",
-		ID:          FlowIDInstagramCookies,
-	}
-	loginFlowMessengerLite = bridgev2.LoginFlow{
+	loginFlowMessengerLiteIOS = bridgev2.LoginFlow{
 		Name:        "Messenger iOS",
-		Description: "Login in using Messenger mobile API",
-		ID:          FlowIDMessengerLite,
+		Description: "Login in using Messenger iOS API",
+		ID:          FlowIDMessengerLiteIOS,
+	}
+	loginFlowMessengerLiteAndroid = bridgev2.LoginFlow{
+		Name:        "Messenger Android",
+		Description: "Login in using Messenger Android API",
+		ID:          FlowIDMessengerLiteAndroid,
 	}
 )
 
@@ -128,10 +133,10 @@ func (m *MetaConnector) GetLoginFlows() []bridgev2.LoginFlow {
 				flows = append(flows, loginFlowFacebook)
 			case types.Messenger:
 				flows = append(flows, loginFlowMessenger)
-			case types.Instagram:
-				flows = append(flows, loginFlowInstagram)
-			case types.MessengerLite:
-				flows = append(flows, loginFlowMessengerLite)
+			case types.MessengerLiteIOS:
+				flows = append(flows, loginFlowMessengerLiteIOS)
+			case types.MessengerLiteAndroid:
+				flows = append(flows, loginFlowMessengerLiteAndroid)
 			default:
 				panic("unknown mode in config")
 			}
@@ -140,7 +145,7 @@ func (m *MetaConnector) GetLoginFlows() []bridgev2.LoginFlow {
 	}
 	switch m.Config.Mode {
 	case types.Unset:
-		return []bridgev2.LoginFlow{loginFlowFacebook, loginFlowMessenger, loginFlowInstagram, loginFlowMessengerLite}
+		return []bridgev2.LoginFlow{loginFlowFacebook, loginFlowMessenger, loginFlowMessengerLiteIOS, loginFlowMessengerLiteAndroid}
 	case types.Facebook:
 		if m.Config.AllowMessengerComOnFB {
 			return []bridgev2.LoginFlow{loginFlowMessenger, loginFlowFacebook}
@@ -150,10 +155,10 @@ func (m *MetaConnector) GetLoginFlows() []bridgev2.LoginFlow {
 		return []bridgev2.LoginFlow{loginFlowFacebook}
 	case types.Messenger:
 		return []bridgev2.LoginFlow{loginFlowMessenger}
-	case types.Instagram:
-		return []bridgev2.LoginFlow{loginFlowInstagram}
-	case types.MessengerLite:
-		return []bridgev2.LoginFlow{loginFlowMessengerLite}
+	case types.MessengerLiteIOS:
+		return []bridgev2.LoginFlow{loginFlowMessengerLiteIOS}
+	case types.MessengerLiteAndroid:
+		return []bridgev2.LoginFlow{loginFlowMessengerLiteAndroid}
 	default:
 		panic("unknown mode in config")
 	}
@@ -163,6 +168,7 @@ type MetaCookieLogin struct {
 	Mode types.Platform
 	User *bridgev2.User
 	Main *MetaConnector
+	HTTP http.RoundTripper
 }
 
 var _ bridgev2.LoginProcessCookies = (*MetaCookieLogin)(nil)
@@ -203,10 +209,6 @@ func (m *MetaCookieLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error
 		step.CookiesParams.URL = "https://www.messenger.com/?no_redirect=true"
 		step.CookiesParams.Fields = cookieListToFields(cookies.FBRequiredCookies, "messenger.com")
 		step.CookiesParams.WaitForURLPattern = "^https://www\\.messenger\\.com/(?:e2ee/)?(?:t/[0-9]+/?)?(?:\\?.*)?$"
-	case types.Instagram:
-		step.CookiesParams.URL = "https://www.instagram.com/accounts/login/"
-		step.CookiesParams.Fields = cookieListToFields(cookies.IGRequiredCookies, "instagram.com")
-		step.CookiesParams.WaitForURLPattern = "^https://www\\.instagram\\.com/(?:direct/(?:inbox/|t/[0-9]+/)?)?(?:\\?.*)?$"
 	default:
 		return nil, fmt.Errorf("unknown mode %s", m.Mode)
 	}
@@ -264,13 +266,6 @@ func loginWithCookies(
 	}
 
 	id := user.GetFBID()
-	if client.Instagram != nil {
-		id, err = client.Instagram.ExtractFBID(user, tbl)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch FBID: %w", err)
-		}
-	}
-
 	loginID := metaid.MakeUserLoginID(id)
 	var loginUA string
 	if req, ok := ctx.Value("fi.mau.provision.request").(*http.Request); ok {
@@ -346,8 +341,14 @@ type MetaNativeLogin struct {
 func (m *MetaNativeLogin) Cancel() {}
 
 func (m *MetaNativeLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
+	return m.StartWithParams(ctx, bridgev2.LoginStartParams{})
+}
+
+func (m *MetaNativeLogin) StartWithParams(ctx context.Context, params bridgev2.LoginStartParams) (*bridgev2.LoginStep, error) {
 	log := m.User.Log.With().Str("component", "messagix").Logger()
-	log.Debug().Msg("Starting Messenger Lite login flow")
+	log.Debug().
+		Bool("client_http", params.HTTP != nil).
+		Msg("Starting Messenger Lite login flow")
 
 	fakeCookies := &cookies.Cookies{
 		Platform: m.Mode,
@@ -355,6 +356,10 @@ func (m *MetaNativeLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error
 	client, err := getMessagixClient(log, m.Main, fakeCookies, m.Main.Config.ProxyMessengerLite)
 	if err != nil {
 		return nil, err
+	}
+	if params.HTTP != nil {
+		client.GetHTTP().GetNewProxy = nil
+		client.GetHTTP().HTTP.Transport = params.HTTP
 	}
 	m.SavedClient = client
 

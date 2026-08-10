@@ -3,11 +3,16 @@ package bloks
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"image"
-	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -19,10 +24,19 @@ import (
 	"go.mau.fi/util/random"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
+
+	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 )
 
 var (
-	ErrLoginPhoneNumber = bridgev2.RespError{ErrCode: "FI.MAU.META_PHONE_NUMBER", Err: "Phone number login is not supported, please try email address or username", StatusCode: http.StatusBadRequest}
+	ErrLoginPhoneNumber      = bridgev2.RespError{ErrCode: "FI.MAU.META_PHONE_NUMBER", Err: "Phone number login is not supported, please try email address or username", StatusCode: http.StatusBadRequest}
+	ErrLoginInvalidUsername  = bridgev2.RespError{ErrCode: "FI.MAU.META_MATRIX_ID", Err: "That doesn't look like a valid username, please enter your Facebook email address or username", StatusCode: http.StatusBadRequest}
+	ErrLoginAFADStopped      = bridgev2.RespError{ErrCode: "FI.MAU.META_AFAD_STOPPED", Err: "The approval request expired or was denied, please try logging in again", StatusCode: http.StatusBadRequest}
+	ErrLoginMandatoryOAuth   = bridgev2.RespError{ErrCode: "FI.MAU.META_OAUTH_MANDATORY", Err: "Meta is requiring Google sign-in which is not supported. Please try adding a different MFA method to your Facebook account from the official app/website", StatusCode: http.StatusBadRequest}
+	ErrLoginNoSupportedMFA   = bridgev2.RespError{ErrCode: "FI.MAU.META_NO_SUPPORTED_MFA", Err: "None of the available MFA methods are supported. Please try adding a different MFA method to your Facebook account from the official app/website", StatusCode: http.StatusBadRequest}
+	ErrLoginReCaptcha        = bridgev2.RespError{ErrCode: "FI.MAU.META_GOOGLE_RECAPTCHA", Err: "Meta is requiring Google reCAPTCHA authentication which is not supported. It may help to try again, log in from the official app/website first, or change MFA settings for your Facebook account"}
+	ErrLoginNoSMSAvailable   = bridgev2.RespError{ErrCode: "FI.MAU.META_NO_SMS_AVAILABLE", Err: "Meta is refusing to send SMS codes right now. Try again later, or use/add a different MFA method for your Facebook account"}
+	ErrLoginMandatoryPasskey = bridgev2.RespError{ErrCode: "FI.MAU.META_PASSKEY_MANDATORY", Err: "Meta is requiring passkey sign-in which is not supported. Please try adding a different MFA method to your Facebook account from the official app/website", StatusCode: http.StatusBadRequest}
 )
 
 // This error is returned in cases where we have observed Meta returning an error that is
@@ -39,7 +53,7 @@ var (
 func ErrLoginUninformative(callsite string) bridgev2.RespError {
 	return bridgev2.RespError{
 		ErrCode:       "FI.MAU.META_UNINFORMATIVE_ERROR",
-		Err:           "Facebook rejected the login without providing a reason, please try again",
+		Err:           "Facebook rejected the login without providing a reason. It may help to try again, log in from the official app/website first, or change MFA settings for your Facebook account",
 		StatusCode:    http.StatusBadRequest,
 		InternalError: "Uninformative login rejection at callsite: " + callsite,
 	}
@@ -88,6 +102,9 @@ func (btn *BloksTreeNode) FindDescendants(pred func(*BloksTreeComponent) bool) [
 }
 
 func (comp *BloksTreeComponent) FindDescendant(pred func(*BloksTreeComponent) bool) *BloksTreeComponent {
+	if comp == nil {
+		return nil
+	}
 	if pred(comp) {
 		return comp
 	}
@@ -100,6 +117,9 @@ func (comp *BloksTreeComponent) FindDescendant(pred func(*BloksTreeComponent) bo
 }
 
 func (comp *BloksTreeComponent) FindDescendants(pred func(*BloksTreeComponent) bool) []*BloksTreeComponent {
+	if comp == nil {
+		return nil
+	}
 	if pred(comp) {
 		return []*BloksTreeComponent{comp}
 	}
@@ -281,35 +301,42 @@ type BrowserState string
 // MFA = Multi-Factor Authentication
 // AP = Authentication Platform
 const (
-	StateUnknown               BrowserState = ""
-	StateTestCaptcha           BrowserState = "test-captcha"
-	StateInitial               BrowserState = "initial"
-	StateEmailPasswordPage     BrowserState = "enter-email-and-password-page"
-	StateCodeEntryPage         BrowserState = "enter-code-page"
-	StateCaptchaPage           BrowserState = "captcha-page"
-	StateMFALandingPage        BrowserState = "mfa-landing-page"
-	StateChooseMFAPage         BrowserState = "choose-mfa-type-page"
-	StateAFADPage              BrowserState = "afad-page"
-	StateAFADPageWaiting       BrowserState = "afad-waiting"
-	StateTOTPPage              BrowserState = "totp-page"
-	StateOAuthPage             BrowserState = "oauth-page"
-	StateSMSPage               BrowserState = "sms-page"
-	StateSMSPageAfterSend      BrowserState = "sms-page-after-send"
-	StateBackupCodePage        BrowserState = "backup-code-page"
-	StateChooseNumberPage      BrowserState = "choose-number-page"
-	StateWhatsAppPage          BrowserState = "whatsapp-page"
-	StateWhatsAppPageAfterSend BrowserState = "whatsapp-page-after-send"
-	StateSuccess               BrowserState = "success"
+	StateUnknown                BrowserState = ""
+	StateTestCaptcha            BrowserState = "test-captcha"
+	StateInitial                BrowserState = "initial"
+	StateEmailPasswordPage      BrowserState = "enter-email-and-password-page"
+	StateCodeEntryPage          BrowserState = "enter-code-page"
+	StateCaptchaPage            BrowserState = "captcha-page"
+	StateMFALandingPage         BrowserState = "mfa-landing-page"
+	StateChooseMFAPage          BrowserState = "choose-mfa-type-page"
+	StateAFADPage               BrowserState = "afad-page"
+	StateAFADPageWaiting        BrowserState = "afad-waiting"
+	StateTOTPPage               BrowserState = "totp-page"
+	StateOAuthPage              BrowserState = "oauth-page"
+	StateSMSPage                BrowserState = "sms-page"
+	StateSMSPageAfterSend       BrowserState = "sms-page-after-send"
+	StateBackupCodePage         BrowserState = "backup-code-page"
+	StateChooseContactPointPage BrowserState = "choose-contact-point-page"
+	StateWhatsAppPage           BrowserState = "whatsapp-page"
+	StateWhatsAppPageAfterSend  BrowserState = "whatsapp-page-after-send"
+	StatePasskeyPage            BrowserState = "passkey"
+	StateSilentCaptchaPage      BrowserState = "noop-captcha"
+	StateSuccess                BrowserState = "success"
 )
 
 type BrowserConfig struct {
+	Platform         types.Platform
 	EncryptPassword  func(context.Context, string) (string, error)
-	MakeBloksRequest func(context.Context, *BloksDoc, *BloksRequestOuter) (*BloksBundle, error)
+	MakeBloksRequest func(context.Context, *BloksDoc, string, BloksParamsInner, string, string) (*BloksBundle, error)
+	FetchAsset       func(ctx context.Context, url string) ([]byte, string, error)
 }
 
 type Browser struct {
-	State       BrowserState
-	CurrentPage *BloksBundle
+	State         BrowserState
+	PreviousState BrowserState
+
+	CurrentPage  *BloksBundle
+	PreviousPage *BloksBundle
 
 	Config *BrowserConfig
 	Bridge *InterpBridge
@@ -321,6 +348,31 @@ type Browser struct {
 	DisplayedURL     string
 
 	LastError string
+}
+
+var genericDeviceNetworkInfo = map[string]any{
+	"active_subscriptions_info": nil,
+	"default_subscription_info": map[string]any{
+		"network_type":           18,
+		"is_data_roaming":        1,
+		"is_esim":                nil,
+		"is_gsm_roaming":         0,
+		"is_sim_sms_capable":     nil,
+		"is_mobile_data_enabled": 0,
+		"sim_carrier_id":         2578,
+		"sim_carrier_id_name":    "Tello",
+		"sim_state":              5,
+		"sim_operator":           "310240",
+		"sim_operator_name":      "Tello",
+		"signal_strength":        2,
+		"group_id_level_1":       nil,
+		"network_operator":       "310260",
+	},
+	"is_airplane_mode":           0,
+	"is_active_network_cellular": 0,
+	"is_device_sms_capable":      1,
+	"sim_count":                  2,
+	"is_wifi":                    1,
 }
 
 // You will want an explanation of how to maintain this code.
@@ -411,11 +463,20 @@ type Browser struct {
 // error state, then we'll re-prompt the user for input, rather than reusing what they gave last
 // time.
 
-func NewBrowser(cfg *BrowserConfig) *Browser {
+func NewBrowser(cfg *BrowserConfig) (*Browser, error) {
 	b := Browser{
 		State:  StateInitial,
 		Config: cfg,
 	}
+	attestationKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate attestation key: %w", err)
+	}
+	attestationPublicKey, err := x509.MarshalPKIXPublicKey(&attestationKey.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("get attestation public key: %w", err)
+	}
+	attestationKeyHash := sha256.Sum256(attestationPublicKey)
 	b.Bridge = &InterpBridge{
 		DeviceID:       strings.ToUpper(uuid.New().String()),
 		FamilyDeviceID: strings.ToUpper(uuid.New().String()),
@@ -434,8 +495,25 @@ func NewBrowser(cfg *BrowserConfig) *Browser {
 		//
 		// The machine_id would generally be a 24 character alphanumeric string. However it
 		// cannot be generated on the client side so this fact is purely informational.
-		MachineID:       "",
-		EncryptPassword: cfg.EncryptPassword,
+		MachineID:         "",
+		DeviceNetworkInfo: genericDeviceNetworkInfo,
+		EncryptPassword:   cfg.EncryptPassword,
+		SignRequestData: func(ctx context.Context, data any) (any, error) {
+			payload, err := json.Marshal(data)
+			if err != nil {
+				return nil, fmt.Errorf("marshal request data: %w", err)
+			}
+			hash := sha256.Sum256(payload)
+			sig, err := ecdsa.SignASN1(rand.Reader, attestationKey, hash[:])
+			if err != nil {
+				return nil, fmt.Errorf("sign request data: %w", err)
+			}
+			return map[string]any{
+				"keyHash":   hex.EncodeToString(attestationKeyHash[:]),
+				"data":      base64.StdEncoding.EncodeToString(payload),
+				"signature": base64.StdEncoding.EncodeToString(sig),
+			}, nil
+		},
 		DoPageRPC: func(ctx context.Context, name string, params map[string]string) (*BloksBundle, error) {
 			log := zerolog.Ctx(ctx)
 			log.Debug().Str("state", string(b.State)).Str("rpc", name).Str("rpc_type", "page").Msg("Invoking RPC from Bloks")
@@ -444,7 +522,11 @@ func NewBrowser(cfg *BrowserConfig) *Browser {
 			if err != nil {
 				return nil, fmt.Errorf("parsing %s params: %w", name, err)
 			}
-			bundle, err := cfg.MakeBloksRequest(ctx, &BloksAppDoc, NewBloksRequest(name, paramsInner))
+			appDoc, err := GetBloksAppDoc(cfg.Platform)
+			if err != nil {
+				return nil, fmt.Errorf("rpc %s: %w", name, err)
+			}
+			bundle, err := cfg.MakeBloksRequest(ctx, appDoc, name, paramsInner, b.Bridge.DeviceID, b.Bridge.FamilyDeviceID)
 			if err != nil {
 				return nil, fmt.Errorf("rpc %s: %w", name, err)
 			}
@@ -458,7 +540,11 @@ func NewBrowser(cfg *BrowserConfig) *Browser {
 			if err != nil {
 				return nil, fmt.Errorf("parsing %s params: %w", name, err)
 			}
-			bundle, err := cfg.MakeBloksRequest(ctx, &BloksActionDoc, NewBloksRequest(name, paramsInner))
+			actionDoc, err := GetBloksActionDoc(cfg.Platform)
+			if err != nil {
+				return nil, fmt.Errorf("rpc %s: %w", name, err)
+			}
+			bundle, err := cfg.MakeBloksRequest(ctx, actionDoc, name, paramsInner, b.Bridge.DeviceID, b.Bridge.FamilyDeviceID)
 			if err != nil {
 				return nil, fmt.Errorf("rpc %s: %w", name, err)
 			}
@@ -482,7 +568,7 @@ func NewBrowser(cfg *BrowserConfig) *Browser {
 			// any variable updates in the callback will be lost.
 			err = b.CurrentPage.Interpreter.MergeActionBundle(ctx, bundle)
 			if err != nil {
-				return nil, fmt.Errorf("merging interpreter with new action")
+				return nil, fmt.Errorf("merging interpreter with new action: %w", err)
 			}
 			return action, nil
 		},
@@ -512,10 +598,13 @@ func NewBrowser(cfg *BrowserConfig) *Browser {
 				} else {
 					newState = StateMFALandingPage
 				}
+			case "com.bloks.www.ap.two_step_verification.limbo_proactive":
+				newState = StateAFADPage
 			case "com.bloks.www.ap.two_step_verification.challenge_picker",
-				"com.bloks.www.two_step_verification.method_picker",
-				"com.bloks.www.caa.ar.auth_method":
+				"com.bloks.www.two_step_verification.method_picker":
 				newState = StateChooseMFAPage
+			case "com.bloks.www.caa.ar.auth_method", "com.bloks.www.ap.two_step_verification.google_oauth":
+				newState = StateMFALandingPage
 			case "com.bloks.www.two_factor_login.enter_totp_code":
 				newState = StateTOTPPage
 			case "com.bloks.www.ap.two_step_verification.login_with_third_party":
@@ -525,9 +614,17 @@ func NewBrowser(cfg *BrowserConfig) *Browser {
 			case "com.bloks.www.two_factor_login.enter_backup_code":
 				newState = StateBackupCodePage
 			case "com.bloks.www.ap.two_step_verification.contactpoint_chooser":
-				newState = StateChooseNumberPage
+				newState = StateChooseContactPointPage
+			case "com.bloks.www.approve_from_another_device.xmds.challenged_device_denied":
+				return ErrLoginAFADStopped
 			case "com.bloks.www.two_step_verification.enter_whatsapp_code":
 				newState = StateWhatsAppPage
+			case "com.bloks.www.ap.passkey_auth":
+				newState = StatePasskeyPage
+			case "com.bloks.www.two_step_verification.no_op_captcha":
+				newState = StateSilentCaptchaPage
+			case "com.bloks.www.two_step_verification.google_recaptcha":
+				return ErrLoginReCaptcha
 			default:
 				return fmt.Errorf("unexpected new screen %s", name)
 			}
@@ -540,6 +637,7 @@ func NewBrowser(cfg *BrowserConfig) *Browser {
 				return err
 			}
 
+			b.PreviousPage = b.CurrentPage
 			b.CurrentPage = page
 			b.State = newState
 			return nil
@@ -561,6 +659,16 @@ func NewBrowser(cfg *BrowserConfig) *Browser {
 			}
 			return nil
 		},
+		CancelTimer: func(name string) error {
+			switch name {
+			case "approve_from_another_device_polling_timer":
+				b.AFADInterval = 0
+				b.AFADCallback = nil
+			default:
+				return fmt.Errorf("unexpected timer cancel %s", name)
+			}
+			return nil
+		},
 		OpenURL: func(url string) error {
 			b.DisplayedURL = url
 			return nil
@@ -577,6 +685,9 @@ func NewBrowser(cfg *BrowserConfig) *Browser {
 				if !ok {
 					return fmt.Errorf("non-string code error: %T", value.Value())
 				}
+				if msg == "" {
+					return nil
+				}
 				b.LastError = msg
 			case "BLOKS_AUTH_PLATFORM_ENTER_CODE:error_message":
 				if b.State != StateCodeEntryPage {
@@ -586,12 +697,21 @@ func NewBrowser(cfg *BrowserConfig) *Browser {
 				if !ok {
 					return fmt.Errorf("non-string email code error: %T", value.Value())
 				}
+				// Sometimes Facebook will set an empty string to this variable,
+				// resetting it, just before making a request that might fail.
+				// Except, we already take care of resetting LastError before we
+				// trigger Bloks code, and we might have already set up LastError
+				// with a default value that we don't want to have reset. So,
+				// require a non-empty string.
+				if msg == "" {
+					return nil
+				}
 				b.LastError = msg
 			}
 			return nil
 		},
 	}
-	return &b
+	return &b, nil
 }
 
 var definitelyNotPhoneNumberRegexp = regexp.MustCompile(`^.*[@a-zA-Z].*$`)
@@ -615,13 +735,14 @@ func (b *Browser) getCodeInstructions() string {
 		GetAttribute("text")
 }
 
-func (b *Browser) getContactNumberInstructions() string {
+func (b *Browser) getContactPointInstructions() string {
 	return b.CurrentPage.
 		FindDescendant(func(comp *BloksTreeComponent) bool {
 			if comp.ComponentID != "bk.data.TextSpan" {
 				return false
 			}
-			return strings.HasPrefix(comp.GetAttribute("text"), "Which number")
+			// "Which number" or "Which email"
+			return strings.HasPrefix(comp.GetAttribute("text"), "Which ")
 		}).
 		GetAttribute("text")
 }
@@ -677,22 +798,38 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 
 	case StateInitial:
 		rpc := "com.bloks.www.bloks.caa.login.process_client_data_and_redirect"
-		action, err := b.Config.MakeBloksRequest(ctx, &BloksActionDoc, NewBloksRequest(rpc, map[string]any{
-			"blocked_uid":                               []any{},
-			"offline_experiment_group":                  "caa_iteration_v2_perf_ls_ios_test_1",
-			"family_device_id":                          b.Bridge.FamilyDeviceID,
-			"use_auto_login_interstitial":               true,
-			"layered_homepage_experiment_group":         "not_in_experiment",
-			"disable_recursive_auto_login_interstitial": true,
-			"show_internal_settings":                    false,
-			"waterfall_id":                              hex.EncodeToString(random.Bytes(16)),
-			"account_list":                              []any{},
-			"disable_auto_login":                        false,
-			"is_from_logged_in_switcher":                false,
-			"auto_login_interstitial_experiment_group":  "",
-			"device_id":                                 b.Bridge.DeviceID,
-			"machine_id":                                b.Bridge.MachineID,
-		}))
+		actionDoc, err := GetBloksActionDoc(b.Config.Platform)
+		if err != nil {
+			return nil, fmt.Errorf("initial request: %w", err)
+		}
+		params := BloksParamsInner{
+			"account_list":           []any{},
+			"blocked_uid":            []any{},
+			"device_id":              b.Bridge.DeviceID,
+			"disable_auto_login":     false,
+			"family_device_id":       b.Bridge.FamilyDeviceID,
+			"show_internal_settings": false,
+			"waterfall_id":           hex.EncodeToString(random.Bytes(16)),
+		}
+		switch b.Config.Platform {
+		case types.MessengerLiteIOS:
+			params["auto_login_interstitial_experiment_group"] = ""
+			params["disable_recursive_auto_login_interstitial"] = true
+			params["is_from_logged_in_switcher"] = false
+			params["layered_homepage_experiment_group"] = "not_in_experiment"
+			params["machine_id"] = b.Bridge.MachineID
+			params["offline_experiment_group"] = "caa_iteration_v2_perf_ls_ios_test_1"
+			params["use_auto_login_interstitial"] = true
+		case types.MessengerLiteAndroid:
+			params["INTERNAL_INFRA_THEME"] = "THREE_NEUTRAL_GRAY"
+			params["device_emails"] = []any{}
+			params["offline_experiment_group"] = "caa_iteration_v3_perf_msg_6"
+			params["openid_tokens"] = map[string]any{}
+			params["spectra_guardian_token"] = ""
+		default:
+			return nil, fmt.Errorf("no initial bloks params for platform %s", b.Config.Platform.String())
+		}
+		action, err := b.Config.MakeBloksRequest(ctx, actionDoc, rpc, params, b.Bridge.DeviceID, b.Bridge.FamilyDeviceID)
 		if err != nil {
 			return nil, fmt.Errorf("rpc %s: %w", rpc, err)
 		}
@@ -738,6 +875,9 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		if !definitelyNotPhoneNumberRegexp.MatchString(username) {
 			return nil, ErrLoginPhoneNumber
 		}
+		if strings.Contains(username, ":") { // covers MXIDs
+			return nil, ErrLoginInvalidUsername
+		}
 
 		// Set up in case we don't navigate to a new page successfully
 		delete(userInput, "username")
@@ -766,9 +906,10 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			log.Debug().Err(err).Msg("Got error from username/password submission")
 			if strings.Contains(err.Error(), "Invalid username or password") {
 				b.LastError = "Invalid username or password"
-			} else if strings.Contains(err.Error(), "isn't connected to an account") {
+			} else if strings.Contains(err.Error(), "isn’t connected to an account") || strings.Contains(err.Error(), "isn't connected to an account") {
+				// Note matching both unicode + ASCII apostrophe - unicode appears to be what Meta uses
 				thing := "username"
-				if strings.Contains("@", username) {
+				if strings.Contains(username, "@") {
 					thing = "email address"
 				}
 				b.LastError = fmt.Sprintf("That %s is not connected to a Messenger account", thing)
@@ -816,7 +957,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		delete(userInput, "otp_code")
 		b.LastError = "Facebook rejected that code"
 
-		err := b.CurrentPage.
+		input := b.CurrentPage.
 			FindDescendant(func(comp *BloksTreeComponent) bool {
 				if comp.ComponentID != "bk.components.TextInput" {
 					return false
@@ -824,8 +965,11 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 				return comp.FindDescendant(FilterByAttribute(
 					"bk.components.AccessibilityExtension", "label", "Enter code",
 				)) != nil
-			}).
-			FillInput(ctx, b.CurrentPage.Interpreter, otpCode)
+			})
+		if input == nil {
+			input = b.CurrentPage.FindDescendant(FilterByComponent("bk.components.TextInput"))
+		}
+		err := input.FillInput(ctx, b.CurrentPage.Interpreter, otpCode)
 		if err != nil {
 			return nil, fmt.Errorf("filling otp code input: %w", err)
 		}
@@ -838,6 +982,8 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			log.Debug().Err(err).Msg("Got error from OTP code submission")
 			if strings.Contains(err.Error(), "Please re-enter") {
 				// retry
+			} else if strings.Contains(err.Error(), "An unexpected error occurred") {
+				return nil, ErrLoginUninformative("otp submit unexpected error")
 			} else {
 				return nil, fmt.Errorf("tapping continue: %w", err)
 			}
@@ -871,7 +1017,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		delete(userInput, "backup_code")
 		b.LastError = "Facebook rejected that code"
 
-		err := b.CurrentPage.
+		input := b.CurrentPage.
 			FindDescendant(func(comp *BloksTreeComponent) bool {
 				if comp.ComponentID != "bk.components.TextInput" {
 					return false
@@ -879,8 +1025,11 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 				return comp.FindDescendant(FilterByAttribute(
 					"bk.components.AccessibilityExtension", "label", "Code",
 				)) != nil
-			}).
-			FillInput(ctx, b.CurrentPage.Interpreter, backupCode)
+			})
+		if input == nil {
+			input = b.CurrentPage.FindDescendant(FilterByComponent("bk.components.TextInput"))
+		}
+		err := input.FillInput(ctx, b.CurrentPage.Interpreter, backupCode)
 		if err != nil {
 			return nil, fmt.Errorf("filling backup code input: %w", err)
 		}
@@ -897,6 +1046,9 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		captchaCode := userInput["captcha_code"]
 		if captchaCode == "" {
 			img := b.CurrentPage.FindDescendant(FilterByAttribute("bk.components.Image", "unique_id", "i:com.bloks.www.two_step_verification.enter_text_captcha_code/p:captcha_image"))
+			if img == nil {
+				img = b.CurrentPage.FindDescendant(FilterByAttribute("bk.components.Image", "scale_type", "stretch"))
+			}
 			if img == nil {
 				return nil, fmt.Errorf("can't find captcha image")
 			}
@@ -928,31 +1080,19 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			audioURL := strings.Replace(b.DisplayedURL, "/player/", "/", 1)
 			log.Trace().Str("audio_url", audioURL).Msg("Found audio captcha")
 
-			imageResp, err := http.Get(imageURL)
+			imageBytes, imageMime, err := b.Config.FetchAsset(ctx, imageURL)
 			if err != nil {
 				return nil, fmt.Errorf("error fetching image response: %w", err)
 			}
-			defer imageResp.Body.Close()
-			imageBytes, err := io.ReadAll(imageResp.Body)
-			if err != nil {
-				return nil, fmt.Errorf("error reading image response body: %w", err)
-			}
-			imageMime := imageResp.Header.Get("content-type")
 			if !strings.HasPrefix(imageMime, "image/") {
 				return nil, fmt.Errorf("bad image captcha mime type %s", imageMime)
 			}
 			imageFilename := "captcha" + exmime.ExtensionFromMimetype(imageMime)
 
-			audioResp, err := http.Get(audioURL)
+			audioBytes, audioMime, err := b.Config.FetchAsset(ctx, audioURL)
 			if err != nil {
 				return nil, fmt.Errorf("error fetching audio response: %w", err)
 			}
-			defer audioResp.Body.Close()
-			audioBytes, err := io.ReadAll(audioResp.Body)
-			if err != nil {
-				return nil, fmt.Errorf("error reading audio response body: %w", err)
-			}
-			audioMime := audioResp.Header.Get("content-type")
 			if !strings.HasPrefix(audioMime, "audio/") {
 				return nil, fmt.Errorf("bad audio captcha mime type %s", audioMime)
 			}
@@ -1008,7 +1148,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		delete(userInput, "captcha_code")
 		b.LastError = "Facebook rejected that captcha solution"
 
-		err := b.CurrentPage.
+		input := b.CurrentPage.
 			FindDescendant(func(comp *BloksTreeComponent) bool {
 				if comp.ComponentID != "bk.components.TextInput" {
 					return false
@@ -1016,7 +1156,11 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 				return comp.FindDescendant(FilterByAttribute(
 					"bk.components.AccessibilityExtension", "label", "Enter characters",
 				)) != nil
-			}).
+			})
+		if input == nil {
+			input = b.CurrentPage.FindDescendant(FilterByComponent("bk.components.TextInput"))
+		}
+		err := input.
 			FillInput(ctx, b.CurrentPage.Interpreter, captchaCode)
 		if err != nil {
 			return nil, fmt.Errorf("filling captcha code input: %w", err)
@@ -1091,6 +1235,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			FindAncestor(FilterByComponent("bk.components.Flexbox")).
 			GetChildren("children")
 
+		numIgnored := 0
 		for _, item := range listItems {
 			span := item.
 				FindDescendant(FilterByComponent("bk.components.RichText")).
@@ -1099,6 +1244,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			method := span.GetAttribute("text")
 			if !knownMethods[method] {
 				log.Warn().Str("mfa_method", method).Msg("Ignoring unsupported MFA method")
+				numIgnored += 1
 				continue
 			}
 			foundMethods[method] = span
@@ -1106,7 +1252,10 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		}
 
 		if len(foundMethods) == 0 {
-			return nil, fmt.Errorf("couldn't find any allowed mfa types")
+			if numIgnored == 0 {
+				return nil, fmt.Errorf("couldn't find any mfa types at all")
+			}
+			return nil, ErrLoginNoSupportedMFA
 		}
 
 		chosenMethod := userInput["mfatype"]
@@ -1176,7 +1325,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		delete(userInput, "totp_code")
 		b.LastError = "Facebook rejected that code"
 
-		err := b.CurrentPage.
+		input := b.CurrentPage.
 			FindDescendant(func(comp *BloksTreeComponent) bool {
 				if comp.ComponentID != "bk.components.TextInput" {
 					return false
@@ -1184,8 +1333,19 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 				return comp.FindDescendant(FilterByAttribute(
 					"bk.components.AccessibilityExtension", "label", "Code",
 				)) != nil
-			}).
-			FillInput(ctx, b.CurrentPage.Interpreter, totpCode)
+			})
+
+		if input == nil {
+			input = b.CurrentPage.
+				FindDescendant(func(comp *BloksTreeComponent) bool {
+					if comp.ComponentID != "bk.components.TextInput" {
+						return false
+					}
+					return comp.GetAttribute("type") == "number"
+				})
+		}
+
+		err := input.FillInput(ctx, b.CurrentPage.Interpreter, totpCode)
 		if err != nil {
 			return nil, fmt.Errorf("filling mfa code input: %w", err)
 		}
@@ -1204,8 +1364,10 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 				return false
 			}
 			for _, prefix := range []string{
-				"We sent a notification",
+				// Covers both "We sent a notification" and "We sent an Instagram notification"/etc
+				"We sent a",
 				"Open the notification",
+				"You need to sign in on",
 			} {
 				if strings.HasPrefix(comp.GetAttribute("text"), prefix) {
 					return true
@@ -1252,15 +1414,21 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 
 	case StateAFADPageWaiting:
 		for b.State == StateAFADPageWaiting {
+			if b.AFADCallback == nil {
+				return nil, ErrLoginAFADStopped
+			}
 			time.Sleep(b.AFADInterval)
 			err := b.AFADCallback()
 			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, fmt.Errorf("login cancelled while waiting for approval: %w", ctxErr)
+				}
 				return nil, fmt.Errorf("AFAD callback: %w", err)
 			}
 		}
 
 	case StateOAuthPage:
-		return nil, fmt.Errorf("can't handle Google OAuth yet")
+		return nil, ErrLoginMandatoryOAuth
 
 	case StateSMSPage:
 		for _, mount := range b.CurrentPage.FindDescendants(FilterByComponent("bk.components.OnMount")) {
@@ -1268,14 +1436,52 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			if script == nil {
 				continue
 			}
-			_, err := b.CurrentPage.Interpreter.Evaluate(ctx, &script.AST)
+			_, err := b.CurrentPage.Interpreter.Evaluate(InterpBindThis(ctx, mount), &script.AST)
 			if err != nil {
+				if strings.Contains(err.Error(), "We can't send a code right now") {
+					return nil, ErrLoginNoSMSAvailable
+				}
 				return nil, fmt.Errorf("sms on_mount script: %w", err)
 			}
 		}
 
 		// Running the on_mount handlers should have triggered a code to be sent.
 		b.State = StateSMSPageAfterSend
+
+	case StateSilentCaptchaPage:
+		// This is handled the same way as the SMS page, it should
+		// trigger a network request which hopefully leads to something
+		// interesting.
+		for _, mount := range b.CurrentPage.FindDescendants(FilterByComponent("bk.components.OnMount")) {
+			script := mount.GetScript("on_first_mount")
+			if script == nil {
+				continue
+			}
+			_, err := b.CurrentPage.Interpreter.Evaluate(InterpBindThis(ctx, mount), &script.AST)
+			if err != nil {
+				// Sometimes the email/password page redirects us to the captcha
+				// page, which then opens a dialog to give the error message.
+				//
+				// So it's possible that we are getting an error from the captcha
+				// process itself, but it's also possible that we are getting a
+				// delayed error that Facebook did not show until after the captcha
+				// request. We try to detect the latter.
+				//
+				// If we end up seeing this happen in cases other than the initial
+				// email/password screen then we'd want to generalize this code.
+				//
+				// Warning: I haven't tested the "return to previous screen" logic.
+				log.Debug().Err(err).Msg("Got error from no-op captcha on_mount script")
+				if strings.Contains(err.Error(), "Invalid username or password") && b.PreviousState == StateEmailPasswordPage {
+					log.Debug().Str("cur_state", string(b.State)).Str("prev_state", string(b.PreviousState)).Msg("Returning to previous Bloks screen")
+					b.State = StateEmailPasswordPage
+					b.CurrentPage = b.PreviousPage
+					b.LastError = "Invalid username or password"
+				} else {
+					return nil, fmt.Errorf("no-op captcha on_mount script: %w", err)
+				}
+			}
+		}
 
 	case StateSMSPageAfterSend:
 		smsCode := userInput["sms_code"]
@@ -1307,7 +1513,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		delete(userInput, "sms_code")
 		b.LastError = "Facebook rejected that code"
 
-		err := b.CurrentPage.
+		input := b.CurrentPage.
 			FindDescendant(func(comp *BloksTreeComponent) bool {
 				if comp.ComponentID != "bk.components.TextInput" {
 					return false
@@ -1315,8 +1521,19 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 				return comp.FindDescendant(FilterByAttribute(
 					"bk.components.AccessibilityExtension", "label", "Code",
 				)) != nil
-			}).
-			FillInput(ctx, b.CurrentPage.Interpreter, smsCode)
+			})
+
+		if input == nil {
+			input = b.CurrentPage.
+				FindDescendant(func(comp *BloksTreeComponent) bool {
+					if comp.ComponentID != "bk.components.TextInput" {
+						return false
+					}
+					return comp.GetAttribute("type") == "number"
+				})
+		}
+
+		err := input.FillInput(ctx, b.CurrentPage.Interpreter, smsCode)
 		if err != nil {
 			return nil, fmt.Errorf("filling sms code input: %w", err)
 		}
@@ -1329,48 +1546,46 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			return nil, fmt.Errorf("tapping continue: %w", err)
 		}
 
-	case StateChooseNumberPage:
+	case StateChooseContactPointPage:
 		buttons := b.CurrentPage.
 			FindDescendants(func(comp *BloksTreeComponent) bool {
-				if comp.ComponentID != "bk.components.AccessibilityExtension" {
-					return false
+				switch comp.ComponentID {
+				case "bk.components.AccessibilityExtension", "accessibilityExtension":
+					return strings.HasPrefix(comp.GetAttribute("label"), "+") || strings.Contains(comp.GetAttribute("label"), "@")
 				}
-				if !strings.HasPrefix(comp.GetAttribute("label"), "+") {
-					return false
-				}
-				return true
+				return false
 			})
 
-		foundNumbers := map[string]*BloksTreeComponent{}
-		numberNames := []string{}
+		foundPoints := map[string]*BloksTreeComponent{}
+		pointNames := []string{}
 		for _, btn := range buttons {
-			number := btn.GetAttribute("label")
-			foundNumbers[number] = btn
-			numberNames = append(numberNames, number)
+			point := btn.GetAttribute("label")
+			foundPoints[point] = btn
+			pointNames = append(pointNames, point)
 		}
 
-		if len(numberNames) == 0 {
-			return nil, fmt.Errorf("failed to find any numbers on contact select page")
+		if len(pointNames) == 0 {
+			return nil, fmt.Errorf("failed to find any contact points on selection page")
 		}
 
-		contactNumber := userInput["contact_number"]
-		if contactNumber == "" && len(foundNumbers) == 1 {
-			contactNumber = numberNames[0]
+		contactPoint := userInput["contact_point"]
+		if contactPoint == "" && len(foundPoints) == 1 {
+			contactPoint = pointNames[0]
 		}
-		if contactNumber == "" {
-			instructions := b.getContactNumberInstructions()
+		if contactPoint == "" {
+			instructions := b.getContactPointInstructions()
 			if instructions == "" {
-				instructions = "Choose the phone number to receive an MFA code"
+				instructions = "Choose where to receive an MFA code"
 			}
 			step = &bridgev2.LoginStep{
 				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       "fi.mau.meta.messengerlite.choose_number",
+				StepID:       "fi.mau.meta.messengerlite.choose_contact_point",
 				Instructions: instructions,
 				UserInputParams: &bridgev2.LoginUserInputParams{
 					Fields: []bridgev2.LoginInputDataField{
 						{
-							ID: "contact_number", Name: "Phone number", Type: bridgev2.LoginInputFieldTypeSelect,
-							Options: numberNames,
+							ID: "contact_point", Name: "Phone number or email", Type: bridgev2.LoginInputFieldTypeSelect,
+							Options: pointNames,
 						},
 					},
 				},
@@ -1378,13 +1593,13 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			break
 		}
 
-		if foundNumbers[contactNumber] == nil {
-			return nil, fmt.Errorf("not a valid contact number: %s", contactNumber)
+		if foundPoints[contactPoint] == nil {
+			return nil, fmt.Errorf("not a valid contact point: %s", contactPoint)
 		}
 
-		err := foundNumbers[contactNumber].FindContainingButton().TapButton(ctx, b.CurrentPage.Interpreter)
+		err := foundPoints[contactPoint].FindContainingButton().TapButton(ctx, b.CurrentPage.Interpreter)
 		if err != nil {
-			return nil, fmt.Errorf("tap selected number: %w", err)
+			return nil, fmt.Errorf("tap selected point: %w", err)
 		}
 		err = b.CurrentPage.
 			FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Continue")).
@@ -1400,7 +1615,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			if script == nil {
 				continue
 			}
-			_, err := b.CurrentPage.Interpreter.Evaluate(ctx, &script.AST)
+			_, err := b.CurrentPage.Interpreter.Evaluate(InterpBindThis(ctx, mount), &script.AST)
 			if err != nil {
 				return nil, fmt.Errorf("whatsapp on_mount script: %w", err)
 			}
@@ -1436,7 +1651,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 		delete(userInput, "whatsapp_code")
 		b.LastError = "Facebook rejected that code"
 
-		err := b.CurrentPage.
+		input := b.CurrentPage.
 			FindDescendant(func(comp *BloksTreeComponent) bool {
 				if comp.ComponentID != "bk.components.TextInput" {
 					return false
@@ -1444,8 +1659,19 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 				return comp.FindDescendant(FilterByAttribute(
 					"bk.components.AccessibilityExtension", "label", "Code",
 				)) != nil
-			}).
-			FillInput(ctx, b.CurrentPage.Interpreter, whatsAppCode)
+			})
+
+		if input == nil {
+			input = b.CurrentPage.
+				FindDescendant(func(comp *BloksTreeComponent) bool {
+					if comp.ComponentID != "bk.components.TextInput" {
+						return false
+					}
+					return comp.GetAttribute("type") == "number"
+				})
+		}
+
+		err := input.FillInput(ctx, b.CurrentPage.Interpreter, whatsAppCode)
 		if err != nil {
 			return nil, fmt.Errorf("filling whatsapp code input: %w", err)
 		}
@@ -1456,6 +1682,18 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			TapButton(ctx, b.CurrentPage.Interpreter)
 		if err != nil {
 			return nil, fmt.Errorf("tapping continue: %w", err)
+		}
+
+	case StatePasskeyPage:
+		btn := b.CurrentPage.
+			FindDescendant(FilterByAttribute("bk.data.TextSpan", "text", "Try another way")).
+			FindContainingButton()
+		if btn == nil {
+			return nil, ErrLoginMandatoryPasskey
+		}
+		err := btn.TapButton(ctx, b.CurrentPage.Interpreter)
+		if err != nil {
+			return nil, fmt.Errorf("tapping try another way button: %w", err)
 		}
 
 	default:
@@ -1470,6 +1708,7 @@ func (b *Browser) DoLoginStep(ctx context.Context, userInput map[string]string) 
 			return nil, fmt.Errorf("handling %s failed to advance flow", prevState)
 		}
 	} else {
+		b.PreviousState = prevState
 		log.Debug().Str("old_state", string(prevState)).Str("new_state", string(b.State)).Msg("Transitioned login step")
 
 		// Ignore LastError, which is only used for signaling an error within the current

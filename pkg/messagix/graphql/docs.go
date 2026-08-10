@@ -13,16 +13,16 @@ const IGDSlideDeltaProcessorQuery = "28239922265610241"
 const IGDTypingIndicatorClientSubscription = "27563068933278040"
 
 var GraphQLDocs = map[string]GraphQLDoc{
-	"LSGraphQLRequest": {
-		DocID:        "7357432314358409",
+	"LSPlatformGraphQLLightspeedRequestQuery": {
+		DocID:        "9697184873702141",
 		FriendlyName: "LSPlatformGraphQLLightspeedRequestQuery",
 	},
-	"LSGraphQLRequestIG": {
+	"LSPlatformGraphQLLightspeedRequestForIGDQuery": {
 		DocID:        "6195354443842040",
 		FriendlyName: "LSPlatformGraphQLLightspeedRequestForIGDQuery",
 	},
 	"MAWCatQuery": {
-		DocID:        "23999698219677129",
+		DocID:        "29559957360285299",
 		FriendlyName: "MAWCatQuery",
 		Jsessw:       "1",
 	},
@@ -133,6 +133,18 @@ var GraphQLDocs = map[string]GraphQLDoc{
 	"IGDThreadListOffMsysPaginationQuery": {
 		DocID:        "27712934271665380",
 		FriendlyName: "IGDThreadListOffMsysPaginationQuery",
+	},
+	"IGDOmniPickerSearchResultsListQuery": {
+		DocID:        "27248216181454285",
+		FriendlyName: "IGDOmniPickerSearchResultsListQuery",
+	},
+	"useCreateOpenGroupThreadOffMsysMutation": {
+		DocID:        "27529949946640544",
+		FriendlyName: "useCreateOpenGroupThreadOffMsysMutation",
+	},
+	"useIGDCreateOptimisticThreadUserQuery": {
+		DocID:        "35274961328786258",
+		FriendlyName: "useIGDCreateOptimisticThreadUserQuery",
 	},
 }
 

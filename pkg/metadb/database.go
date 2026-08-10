@@ -58,14 +58,10 @@ func New(bridgeID networkid.BridgeID, db *dbutil.Database, log zerolog.Logger) *
 	}
 }
 
-var table dbutil.UpgradeTable
+var table = dbutil.BuildUpgradeTable().WithFS(upgrades).Finish()
 
 //go:embed *.sql
 var upgrades embed.FS
-
-func init() {
-	table.RegisterFS(upgrades)
-}
 
 func (db *MetaDB) PutThread(ctx context.Context, parentKey, threadKey int64, messageID string) error {
 	_, err := db.Exec(ctx, `
@@ -88,6 +84,47 @@ func (db *MetaDB) GetThreadByKey(ctx context.Context, threadKey int64) (parentKe
 func (db *MetaDB) GetThreadByMessage(ctx context.Context, messageID string) (threadKey int64, err error) {
 	err = db.QueryRow(ctx, "SELECT thread_key FROM meta_thread WHERE message_id = $1", messageID).
 		Scan(&threadKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+	}
+	return
+}
+
+func (db *MetaDB) PutHybridThreadMapping(ctx context.Context, loginID networkid.UserLoginID, fbThreadKey, threadJID, threadType int64) error {
+	_, err := db.Exec(ctx, `
+		INSERT INTO meta_hybrid_thread (bridge_id, login_id, fb_thread_key, thread_jid, thread_type)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (bridge_id, login_id, fb_thread_key) DO UPDATE SET
+			thread_jid = excluded.thread_jid,
+			thread_type = CASE WHEN excluded.thread_type = 0 THEN meta_hybrid_thread.thread_type ELSE excluded.thread_type END
+	`, db.BridgeID, loginID, fbThreadKey, threadJID, threadType)
+	return err
+}
+
+func (db *MetaDB) GetHybridThreadJID(ctx context.Context, loginID networkid.UserLoginID, fbThreadKey int64) (threadJID, threadType int64, err error) {
+	err = db.QueryRow(ctx, `
+		SELECT thread_jid, thread_type FROM meta_hybrid_thread
+		WHERE bridge_id = $1 AND login_id = $2 AND fb_thread_key = $3
+	`, db.BridgeID, loginID, fbThreadKey).Scan(&threadJID, &threadType)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+	}
+	return
+}
+
+func (db *MetaDB) SetHybridThreadMessageRequest(ctx context.Context, loginID networkid.UserLoginID, fbThreadKey int64, messageRequest bool) error {
+	_, err := db.Exec(ctx, `
+		UPDATE meta_hybrid_thread SET message_request = $4
+		WHERE bridge_id = $1 AND login_id = $2 AND fb_thread_key = $3
+	`, db.BridgeID, loginID, fbThreadKey, messageRequest)
+	return err
+}
+
+func (db *MetaDB) GetHybridThreadInfoByJID(ctx context.Context, loginID networkid.UserLoginID, threadJID int64) (fbThreadKey int64, messageRequest bool, err error) {
+	err = db.QueryRow(ctx, `
+		SELECT fb_thread_key, message_request FROM meta_hybrid_thread
+		WHERE bridge_id = $1 AND login_id = $2 AND thread_jid = $3
+	`, db.BridgeID, loginID, threadJID).Scan(&fbThreadKey, &messageRequest)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = nil
 	}
@@ -189,13 +226,22 @@ func (db *MetaDB) GetIGUserForFBID(ctx context.Context, fbid int64) (igid string
 	return
 }
 
+func (db *MetaDB) GetIGChatForFBID(ctx context.Context, fbid int64, login networkid.UserLoginID) (igid string, err error) {
+	err = db.QueryRow(ctx, "SELECT igid FROM meta_instagram_chat_id WHERE fbid = $1 AND login = $2 AND bridge_id = $3", fbid, login, db.BridgeID).Scan(&igid)
+	if errors.Is(err, sql.ErrNoRows) {
+		// return "" if not cached
+		err = nil
+	}
+	return
+}
+
 func (db *MetaDB) GetFBIDForIGThread(ctx context.Context, igid string, login networkid.UserLoginID) (fbid int64, err error) {
 	var ok bool
 	fbid, ok = db.igThreadMap.Get(keyWithLogin{igid, login})
 	if ok {
 		return fbid, nil
 	}
-	err = db.QueryRow(ctx, "SELECT fbid FROM meta_instagram_thread_id WHERE igid = $1 AND login = $2", igid, login).Scan(&fbid)
+	err = db.QueryRow(ctx, "SELECT fbid FROM meta_instagram_thread_id WHERE igid = $1 AND login = $2 AND bridge_id = $3", igid, login, db.BridgeID).Scan(&fbid)
 	if errors.Is(err, sql.ErrNoRows) {
 		// return 0 if not cached
 		err = nil
@@ -211,7 +257,7 @@ func (db *MetaDB) GetFBIDForIGChat(ctx context.Context, igid string, login netwo
 	if ok {
 		return fbid, nil
 	}
-	err = db.QueryRow(ctx, "SELECT fbid FROM meta_instagram_chat_id WHERE igid = $1 AND login = $2", igid, login).Scan(&fbid)
+	err = db.QueryRow(ctx, "SELECT fbid FROM meta_instagram_chat_id WHERE igid = $1 AND login = $2 AND bridge_id = $3", igid, login, db.BridgeID).Scan(&fbid)
 	if errors.Is(err, sql.ErrNoRows) {
 		// return 0 if not cached
 		err = nil
@@ -244,7 +290,7 @@ func (db *MetaDB) PutFBIDForIGThread(ctx context.Context, igid string, fbid int6
 	if exists {
 		return nil
 	}
-	_, err := db.Exec(ctx, "INSERT INTO meta_instagram_thread_id (igid, fbid, login) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", igid, fbid, login)
+	_, err := db.Exec(ctx, "INSERT INTO meta_instagram_thread_id (bridge_id, igid, fbid, login) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING", db.BridgeID, igid, fbid, login)
 	return err
 }
 
@@ -256,7 +302,7 @@ func (db *MetaDB) PutFBIDForIGChat(ctx context.Context, igid string, fbid int64,
 	if exists {
 		return nil
 	}
-	_, err := db.Exec(ctx, "INSERT INTO meta_instagram_chat_id (igid, fbid, login) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", igid, fbid, login)
+	_, err := db.Exec(ctx, "INSERT INTO meta_instagram_chat_id (bridge_id, igid, fbid, login) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING", db.BridgeID, igid, fbid, login)
 	return err
 }
 

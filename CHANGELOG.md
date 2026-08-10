@@ -1,13 +1,23 @@
-# v26.07 (unreleased)
+# v26.08 (unreleased)
 
+* Removed Instagram support from the mautrix-meta bridge.
+  Only mautrix-instagram can be used for Instagram now.
+* Added notices for calls from Instagram.
+* Improved iOS Messenger login mode and added Android Messenger as an option.
+* Fixed Instagram ghost profiles not being updated when receiving a message.
+* Fixed bridging edits from Instagram.
+
+# v26.07
+
+* Updated Docker image to Alpine 3.24.
 * Added new Instagram bridge.
   * Existing bridges configured with `mode: instagram` can seamlessly switch to
     the new bridge by just replacing the binary (`mautrix-meta` →
     `mautrix-instagram`) or Docker image (still `dock.mau.dev/mautrix/meta`, but
     with an `ig-` prefix for the tag, e.g. `:ig-latest` or `:ig-v26.07`).
-  * Mixed-mode bridges can't be migrated. Trying to do that will break all
-    Messenger logins.
-  * The old bridge still works until Meta breaks the old API.
+  * The old bridge can still be used for Instagram, but only on this release.
+    After this release, mautrix-meta can only be used for Messenger.
+  * More details can be found in the [release post](https://mau.fi/blog/2026-07-mautrix-release/#new-instagram-bridge).
 * Added support for bridging text formatting.
 * Removed support for bridging typing notifications in legacy Instagram bridge.
 

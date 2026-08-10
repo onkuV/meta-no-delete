@@ -104,6 +104,18 @@ func (c *Client) GetProfile(ctx context.Context, igid string) (*slidetypes.Profi
 	return makeGraphQLRequest[*slidetypes.ProfilePageResponse](ctx, c, "PolarisProfilePageContentQuery", slidetypes.MakeProfilePageRequest(igid), true)
 }
 
+func (c *Client) GetUserForNewDM(ctx context.Context, fbid int64) (*slidetypes.UserInfoResponse, error) {
+	return makeGraphQLRequest[*slidetypes.UserInfoResponse](ctx, c, "useIGDCreateOptimisticThreadUserQuery", &slidetypes.GetUserInfoByFBIDRequest{MessagingUserFBID: fbid}, true)
+}
+
+func (c *Client) SearchUsers(ctx context.Context, query string) (*slidetypes.SearchResponse, error) {
+	return makeGraphQLRequest[*slidetypes.SearchResponse](ctx, c, "IGDOmniPickerSearchResultsListQuery", slidetypes.SearchRequest{SearchText: query}, true)
+}
+
+func (c *Client) CreateGroup(ctx context.Context, req *slidetypes.CreateGroupRequest) (*slidetypes.CreateGroupResponse, error) {
+	return makeGraphQLRequest[*slidetypes.CreateGroupResponse](ctx, c, "useCreateOpenGroupThreadOffMsysMutation", req, true)
+}
+
 func (c *Client) EditGroupTitle(ctx context.Context, threadID, newTitle string) error {
 	_, err := makeGraphQLRequest[noResp](ctx, c, "IGDEditThreadNameDialogOffMsysMutation", &graphql.IGEditGroupTitleGraphQLRequestPayload{
 		ThreadID: threadID,
@@ -121,6 +133,7 @@ func makeGraphQLRequest[T any](ctx context.Context, c *Client, name string, req 
 	}
 	_, respData, err := c.http.MakeGraphQLRequest(ctx, name, req)
 	if err != nil {
+		c.checkResponseError(err)
 		return
 	}
 	var wrappedResp graphql.Response[T]
@@ -131,12 +144,14 @@ func makeGraphQLRequest[T any](ctx context.Context, c *Client, name string, req 
 	} else if allowReload && wrappedResp.ErrorCode == types.ErrPleaseReloadPage.ErrorCode {
 		zerolog.Ctx(ctx).Warn().Err(wrappedResp.AsError()).
 			Msg("Got please reload page error, reloading index and retrying")
-		reloadErr := c.ReloadIndex(ctx)
+		didReload, reloadErr := c.ReloadIndex(ctx)
 		if reloadErr != nil {
 			zerolog.Ctx(ctx).Err(err).Msg("Failed to reload page to retry GraphQL request")
-		} else {
+		} else if didReload {
 			zerolog.Ctx(ctx).Debug().Msg("Successfully reloaded index, retrying GraphQL request")
 			return makeGraphQLRequest[T](ctx, c, name, req, false)
+		} else {
+			zerolog.Ctx(ctx).Debug().Msg("Didn't reload index, not retrying GraphQL request")
 		}
 	}
 	return wrappedResp.Data, wrappedResp.AsError()

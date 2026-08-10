@@ -139,18 +139,21 @@ func (c *Client) loadIndex(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) ReloadIndex(ctx context.Context) error {
+func (c *Client) ReloadIndex(ctx context.Context) (bool, error) {
+	if c == nil {
+		return false, ErrClientIsNil
+	}
 	c.loadIndexLock.Lock()
 	defer c.loadIndexLock.Unlock()
 	if time.Since(c.lastReload) < 15*time.Minute {
 		zerolog.Ctx(ctx).Debug().
 			Time("last_reload", c.lastReload).
 			Msg("Not reloading again as last reload was recent")
-		return nil
+		return false, nil
 	}
 	err := c.loadIndex(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if s := c.socket.Load(); s != nil {
 		s.DeviceID = c.configs.BrowserConfigTable.IGDMqttWebDeviceID.ClientID
@@ -165,7 +168,7 @@ func (c *Client) ReloadIndex(ctx context.Context) error {
 	} else {
 		c.makeNewSocket()
 	}
-	return nil
+	return true, nil
 }
 
 func (c *Client) LoadIndex(ctx context.Context) (*types.PolarisViewer, *slidetypes.Mailbox, error) {
@@ -198,7 +201,9 @@ func (c *Client) LoadIndex(ctx context.Context) (*types.PolarisViewer, *slidetyp
 }
 
 func (c *Client) GetOwnFBID() int64 {
-	if c.configs.BrowserConfigTable.CurrentUserInitialData.IGUserEIMU == "" || c.configs.BrowserConfigTable.PolarisViewer.Data.Fbid != c.configs.BrowserConfigTable.CurrentUserInitialData.NonFacebookUserID {
+	if c == nil || c.configs == nil ||
+		c.configs.BrowserConfigTable.CurrentUserInitialData.IGUserEIMU == "" ||
+		c.configs.BrowserConfigTable.PolarisViewer.Data.Fbid != c.configs.BrowserConfigTable.CurrentUserInitialData.NonFacebookUserID {
 		return 0
 	}
 	fbid, _ := strconv.ParseInt(c.configs.BrowserConfigTable.CurrentUserInitialData.IGUserEIMU, 10, 64)
@@ -206,6 +211,9 @@ func (c *Client) GetOwnFBID() int64 {
 }
 
 func (c *Client) GetCookies() *cookies.Cookies {
+	if c == nil {
+		return nil
+	}
 	return c.cookies
 }
 
@@ -218,7 +226,7 @@ func (c *Client) GetPlatform() types.Platform {
 }
 
 func (c *Client) IsAuthenticated() bool {
-	return c.cookies.IsLoggedIn() && c.configs.BrowserConfigTable.PolarisViewer.ID != ""
+	return c != nil && c.cookies.IsLoggedIn() && c.configs.BrowserConfigTable.PolarisViewer.ID != ""
 }
 
 func (c *Client) GetLogger() *zerolog.Logger {
@@ -230,6 +238,9 @@ func (c *Client) SetLogger(logger zerolog.Logger) {
 }
 
 func (c *Client) GetHTTP() *httpclient.HTTPClient {
+	if c == nil {
+		return nil
+	}
 	return c.http
 }
 
@@ -263,12 +274,14 @@ func (c *Client) LoadState(state json.RawMessage) error {
 }
 
 func (c *Client) SetSeqID(seqID int64, ts time.Time) {
-	c.seqID = seqID
-	c.seqIDTS = ts
+	if c != nil {
+		c.seqID = seqID
+		c.seqIDTS = ts
+	}
 }
 
 func (c *Client) HasSeqID() bool {
-	return c.seqID != 0
+	return c != nil && c.seqID != 0
 }
 
 func (c *Client) DumpState() (json.RawMessage, error) {
@@ -279,4 +292,14 @@ func (c *Client) DumpState() (json.RawMessage, error) {
 		Configs:   c.configs,
 		Timestamp: c.lastReload,
 	})
+}
+
+func (c *Client) checkResponseError(err error) {
+	if errors.Is(err, httpclient.ErrChallengeRequired) ||
+		errors.Is(err, httpclient.ErrCheckpointRequired) ||
+		errors.Is(err, httpclient.ErrCheckpointRequired) ||
+		errors.Is(err, httpclient.ErrConsentRequired) ||
+		errors.Is(err, httpclient.ErrTokenInvalidated) {
+		_ = c.eventHandler(context.TODO(), &slidetypes.AuthError{Error: err})
+	}
 }

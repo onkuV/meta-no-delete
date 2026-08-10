@@ -136,6 +136,7 @@ type LSTable struct {
 	LSDeleteThenInsertBotProfileInfoV2               []*LSDeleteThenInsertBotProfileInfoV2               `json:",omitempty"`
 	LSHandleSyncFailure                              []*LSHandleSyncFailure                              `json:",omitempty"`
 	LSDeleteThread                                   []*LSDeleteThread                                   `json:",omitempty"`
+	LSDeletePartialThread                            []*LSDeletePartialThread                            `json:",omitempty"`
 	LSAddPollForThread                               []*LSAddPollForThread                               `json:",omitempty"`
 	LSAddPollOption                                  []*LSAddPollOption                                  `json:",omitempty"`
 	LSAddPollOptionV2                                []*LSAddPollOption                                  `json:",omitempty"`
@@ -162,6 +163,7 @@ type LSTable struct {
 	LSResetGroupInvites                              []*LSResetGroupInvites                              `json:",omitempty"`
 	LSDeleteMessageRequest                           []*LSDeleteMessageRequest                           `json:",omitempty"`
 	LSFillDeanonCacheForE2EEThread                   []*LSFillDeanonCacheForE2EEThread                   `json:",omitempty"`
+	LSDisableSyncForSyncGroup                        []*LSDisableSyncForSyncGroup                        `json:",omitempty"`
 }
 
 func (t *LSTable) NonNilFields() (fields []string) {
@@ -301,6 +303,7 @@ var SPTable = map[string]string{
 	"deleteThenInsertBotProfileInfoV2":               "LSDeleteThenInsertBotProfileInfoV2",
 	"handleSyncFailure":                              "LSHandleSyncFailure",
 	"deleteThread":                                   "LSDeleteThread",
+	"deletePartialThread":                            "LSDeletePartialThread",
 	"addPollOption":                                  "LSAddPollOption",
 	"addPollOptionV2":                                "LSAddPollOptionV2",
 	"addPollVote":                                    "LSAddPollVote",
@@ -328,6 +331,7 @@ var SPTable = map[string]string{
 	"resetGroupInvites":                              "LSResetGroupInvites",
 	"deleteMessageRequest":                           "LSDeleteMessageRequest",
 	"fillDeanonCacheForE2EEThread":                   "LSFillDeanonCacheForE2EEThread",
+	"disableSyncForSyncGroup":                        "LSDisableSyncForSyncGroup",
 }
 
 func SPToDepMap(sp []string) map[string]string {

@@ -2,10 +2,10 @@ package connector
 
 import (
 	"context"
-	"errors"
 	"net/url"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exmaps"
 	"go.mau.fi/util/ptr"
@@ -17,56 +17,50 @@ import (
 	"maunium.net/go/mautrix/event"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix"
-	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
+	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
 )
 
 const (
-	WADisconnected             status.BridgeStateErrorCode = "wa-transient-disconnect"
-	WAPermanentError           status.BridgeStateErrorCode = "wa-unknown-permanent-error"
-	WACATError                 status.BridgeStateErrorCode = "wa-cat-refresh-error"
-	WAConnectError             status.BridgeStateErrorCode = "wa-unknown-connect-error"
-	MetaConnectionUnauthorized status.BridgeStateErrorCode = "meta-connection-unauthorized"
-	MetaPermanentError         status.BridgeStateErrorCode = "meta-unknown-permanent-error"
-	MetaCookieRemoved          status.BridgeStateErrorCode = "meta-cookie-removed"
-	MetaUserIDIsZero           status.BridgeStateErrorCode = "meta-user-id-is-zero"
-	MetaRedirectedToLoginPage  status.BridgeStateErrorCode = "meta-redirected-to-login"
-	MetaNotLoggedIn            status.BridgeStateErrorCode = "meta-not-logged-in"
-	MetaConnectError           status.BridgeStateErrorCode = "meta-connect-error"
-	MetaGraphQLError           status.BridgeStateErrorCode = "meta-graphql-error"
-	MetaTransientDisconnect    status.BridgeStateErrorCode = "meta-transient-disconnect"
-	IGChallengeRequired        status.BridgeStateErrorCode = "ig-challenge-required"
-	IGChallengeRequiredMaybe   status.BridgeStateErrorCode = "ig-challenge-required-maybe"
-	IGAccountSuspended         status.BridgeStateErrorCode = "ig-account-suspended"
-	MetaServerUnavailable      status.BridgeStateErrorCode = "meta-server-unavailable"
-	IGConsentRequired          status.BridgeStateErrorCode = "ig-consent-required"
-	FBConsentRequired          status.BridgeStateErrorCode = "fb-consent-required"
-	FBCheckpointRequired       status.BridgeStateErrorCode = "fb-checkpoint-required"
-	MetaProxyUpdateFail        status.BridgeStateErrorCode = "meta-proxy-update-fail"
-	MetaConnectError24         status.BridgeStateErrorCode = "meta-connect-error-24"
+	WADisconnected            status.BridgeStateErrorCode = "wa-transient-disconnect"
+	WAPermanentError          status.BridgeStateErrorCode = "wa-unknown-permanent-error"
+	WACATError                status.BridgeStateErrorCode = "wa-cat-refresh-error"
+	WAConnectError            status.BridgeStateErrorCode = "wa-unknown-connect-error"
+	DGWConnectionUnauthorized status.BridgeStateErrorCode = "dgw-connection-unauthorized"
+	MetaPermanentError        status.BridgeStateErrorCode = "meta-unknown-permanent-error"
+	MetaCookieRemoved         status.BridgeStateErrorCode = "meta-cookie-removed"
+	MetaUserIDIsZero          status.BridgeStateErrorCode = "meta-user-id-is-zero"
+	MetaRedirectedToLoginPage status.BridgeStateErrorCode = "meta-redirected-to-login"
+	MetaNotLoggedIn           status.BridgeStateErrorCode = "meta-not-logged-in"
+	MetaConnectError          status.BridgeStateErrorCode = "meta-connect-error"
+	MetaGraphQLError          status.BridgeStateErrorCode = "meta-graphql-error"
+	MetaTransientDisconnect   status.BridgeStateErrorCode = "meta-transient-disconnect"
+	FBChallengeRequired       status.BridgeStateErrorCode = "fb-challenge-required"
+	FBAccountSuspended        status.BridgeStateErrorCode = "fb-account-suspended"
+	FBConsentRequired         status.BridgeStateErrorCode = "fb-consent-required"
+	FBCheckpointRequired      status.BridgeStateErrorCode = "fb-checkpoint-required"
+	MetaProxyUpdateFail       status.BridgeStateErrorCode = "meta-proxy-update-fail"
+	IGNotSupported            status.BridgeStateErrorCode = "meta-ig-not-supported"
 )
 
 func init() {
 	status.BridgeStateHumanErrors.Update(status.BridgeStateErrorMap{
-		WADisconnected:             "Disconnected from encrypted chat server. Trying to reconnect.",
-		MetaTransientDisconnect:    "Disconnected from server, trying to reconnect",
-		MetaConnectionUnauthorized: "Logged out, please relogin to continue",
-		MetaCookieRemoved:          "Logged out, please relogin to continue",
-		MetaUserIDIsZero:           "Logged out, please relogin to continue",
-		MetaRedirectedToLoginPage:  "Logged out, please relogin to continue",
-		MetaNotLoggedIn:            "Logged out, please relogin to continue",
-		IGAccountSuspended:         "Logged out, please check the Instagram website to continue",
-		IGChallengeRequired:        "Challenge required, please check the Instagram website to continue",
-		IGChallengeRequiredMaybe:   "Connection refused, please check the Instagram website to continue",
-		IGConsentRequired:          "Consent required, please check the Instagram website to continue",
-		FBConsentRequired:          "Consent required, please check the Facebook website to continue",
-		FBCheckpointRequired:       "Checkpoint required, please check the Facebook website to continue",
-		MetaServerUnavailable:      "Connection refused by server",
-		MetaConnectError:           "Unknown connection error",
-		MetaProxyUpdateFail:        "Failed to update proxy",
-		MetaConnectError24:         "Unknown connection error 24",
+		WADisconnected:            "Disconnected from encrypted chat server. Trying to reconnect.",
+		MetaTransientDisconnect:   "Disconnected from server, trying to reconnect",
+		DGWConnectionUnauthorized: "Logged out, please relogin to continue",
+		MetaCookieRemoved:         "Logged out, please relogin to continue",
+		MetaUserIDIsZero:          "Logged out, please relogin to continue",
+		MetaRedirectedToLoginPage: "Logged out, please relogin to continue",
+		MetaNotLoggedIn:           "Logged out, please relogin to continue",
+		FBAccountSuspended:        "Logged out, please check the Facebook website to continue",
+		FBChallengeRequired:       "Challenge required, please check the Facebook website to continue",
+		FBConsentRequired:         "Consent required, please check the Facebook website to continue",
+		FBCheckpointRequired:      "Checkpoint required, please check the Facebook website to continue",
+		MetaConnectError:          "Unknown connection error",
+		MetaProxyUpdateFail:       "Failed to update proxy",
+		IGNotSupported:            "This bridge no longer supports Instagram",
 	})
 }
 
@@ -74,19 +68,18 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 	log := m.UserLogin.Log
 
 	switch evt := rawEvt.(type) {
-	case *messagix.Event_PublishResponse:
-		log.Trace().Any("table", &evt.Table).Msg("Got new event")
-		for _, rng := range evt.Table.LSInsertNewMessageRange {
+	case *table.LSTable:
+		log.Trace().Any("table", evt).Msg("Got new event")
+		for _, rng := range evt.LSInsertNewMessageRange {
 			log.Debug().Any("message_range", rng).Msg("Message range in publish response")
 		}
-		m.parseAndQueueTable(ctx, evt.Table, false)
-	case *messagix.Event_Ready:
+		m.parseAndQueueTable(ctx, evt, false)
+	case *messagix.ConnectedEvent:
 		log.Debug().Msg("Initial connect to Meta socket completed")
+		m.permanentErrored.Store(false)
 		m.connectWaiter.Set()
-		if m.LoginMeta.Platform.IsMessenger() {
-			m.firstE2EEConnectDone = true
-			go m.tryConnectE2EE(false)
-		}
+		m.firstE2EEConnectDone = true
+		go m.tryConnectE2EE(false)
 		m.metaState = status.BridgeState{StateEvent: status.StateConnected}
 		m.UserLogin.BridgeState.Send(m.metaState)
 		if tbl := m.initialTable.Swap(nil); tbl != nil {
@@ -99,7 +92,7 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 				log.Err(err).Msg("Thread backfill failed")
 			}
 		}()
-	case *messagix.Event_SocketError:
+	case *messagix.TransientDisconnectEvent:
 		log.Debug().Err(evt.Err).Msg("Disconnected from Meta socket")
 		m.connectWaiter.Clear()
 		m.metaState = status.BridgeState{
@@ -107,8 +100,8 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 			Error:      MetaTransientDisconnect,
 		}
 		m.UserLogin.BridgeState.Send(m.metaState)
-	case *messagix.Event_Reconnected:
-		if !m.firstE2EEConnectDone && m.LoginMeta.Platform.IsMessenger() {
+	case *messagix.ReconnectedEvent:
+		if !m.firstE2EEConnectDone {
 			m.firstE2EEConnectDone = true
 			go m.tryConnectE2EE(false)
 		}
@@ -116,40 +109,14 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 		m.connectWaiter.Set()
 		m.metaState = status.BridgeState{StateEvent: status.StateConnected}
 		m.UserLogin.BridgeState.Send(m.metaState)
-	case *messagix.Event_PermanentError:
-		if errors.Is(evt.Err, messagix.CONNECTION_REFUSED_UNAUTHORIZED) {
+	case *messagix.PermanentErrorEvent:
+		// TODO do full reconnect in some cases?
+		m.permanentErrored.Store(true)
+		if websocket.CloseStatus(evt.Err) == dgw.CloseStatusUnauthorized {
 			m.metaState = status.BridgeState{
 				StateEvent: status.StateBadCredentials,
-				Error:      MetaConnectionUnauthorized,
-			}
-		} else if errors.Is(evt.Err, messagix.CONNECTION_REFUSED_SERVER_UNAVAILABLE) {
-			m.metaState = status.BridgeState{
-				StateEvent: status.StateUnknownError,
-				Error:      MetaServerUnavailable,
-			}
-			if m.canReconnect() {
-				log.Debug().Msg("Doing full reconnect after server unavailable error")
-				go m.FullReconnect()
-			} else if !m.Main.Config.Mode.IsMessenger() {
-				// Instagram server unavailables have historically been more likely to be bad credentials,
-				// so default to that if we reconnected too recently.
-				m.metaState = status.BridgeState{
-					StateEvent: status.StateBadCredentials,
-					Error:      IGChallengeRequiredMaybe,
-					UserAction: status.UserActionRestart,
-				}
-			}
-		} else if errors.Is(evt.Err, messagix.CONNECTION_REFUSED_UNKNOWN_24) {
-			m.metaState = status.BridgeState{
-				StateEvent: status.StateUnknownError,
-				Error:      MetaConnectError24,
-			}
-			if m.canReconnectError24() {
-				m.metaState.StateEvent = status.StateTransientDisconnect
-				log.Debug().Msg("Doing full reconnect after ConnectionCode(24)")
-				go m.FullReconnect()
-			} else {
-				log.Warn().Msg("Last full reconnect was too recent, can't reconnect after ConnectionCode(24)")
+				Error:      DGWConnectionUnauthorized,
+				Message:    evt.Err.Error(),
 			}
 		} else {
 			m.metaState = status.BridgeState{
@@ -231,60 +198,6 @@ func (m *MetaClient) handleParsedTable(ctx context.Context, isInitial bool, tbl 
 	if ctx.Err() != nil {
 		return
 	}
-	if m.Client.GetPlatform() == types.Instagram {
-		contactsWithoutIGID := []int64{}
-		for _, contact := range tbl.LSVerifyContactRowExists {
-			if ctx.Err() != nil {
-				return
-			}
-			igid, err := m.Main.DB.GetIGUserForFBID(ctx, contact.GetFBID())
-			if err != nil {
-				zerolog.Ctx(ctx).Warn().Err(err).Msg("Error getting IG user for FBID")
-				continue
-			}
-			if igid == "" {
-				contactsWithoutIGID = append(contactsWithoutIGID, contact.GetFBID())
-			}
-		}
-		go func() {
-			for len(contactsWithoutIGID) > 0 {
-				// Web client seems to fetch in groups of up to five
-				batchSize := 5
-				if len(contactsWithoutIGID) < batchSize {
-					batchSize = len(contactsWithoutIGID)
-				}
-				contactsBatch := contactsWithoutIGID[:batchSize]
-				tasks := []socket.Task{}
-				for _, contact := range contactsBatch {
-					tasks = append(tasks, &socket.GetContactsFullTask{
-						ContactID: contact,
-					})
-				}
-				resp, err := m.Client.ExecuteTasks(ctx, tasks...)
-				if err != nil {
-					zerolog.Ctx(ctx).Warn().Err(err).Ints64("fbids", contactsBatch).Msg("user info request failed")
-					return
-				}
-				for _, info := range resp.LSDeleteThenInsertIGContactInfo {
-					err := m.Main.DB.PutFBIDForIGUser(ctx, info.IgId, info.ContactId)
-					if err != nil {
-						zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to save FBID for IG user")
-						return
-					}
-				}
-				if len(contactsWithoutIGID) <= batchSize {
-					return
-				}
-				contactsWithoutIGID = contactsWithoutIGID[batchSize:]
-			}
-		}()
-		for _, info := range tbl.LSDeleteThenInsertIGContactInfo {
-			err := m.Main.DB.PutFBIDForIGUser(ctx, info.IgId, info.ContactId)
-			if err != nil {
-				zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to save FBID for IG user")
-			}
-		}
-	}
 	for _, evt := range innerQueue {
 		if ctx.Err() != nil {
 			return
@@ -338,10 +251,16 @@ func (m *MetaClient) parseTable(ctx context.Context, tbl *table.LSTable) (innerQ
 	innerQueue = make([]bridgev2.RemoteEvent, 0, 8)
 	for _, jid := range tbl.LSUpdateThreadAuthorityAndMappingWithOTIDFromJID {
 		waThreadMap[jid.ThreadKey] = jid.ThreadJID
+		if err := m.Main.DB.PutHybridThreadMapping(ctx, m.UserLogin.ID, jid.ThreadKey, jid.ThreadJID, 0); err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to persist hybrid thread mapping")
+		}
 		activeThreads.Add(jid.ThreadJID)
 	}
 	for _, jid := range tbl.LSVerifyHybridThreadExists {
 		waThreadMap[jid.ThreadKey] = jid.ThreadJID
+		if err := m.Main.DB.PutHybridThreadMapping(ctx, m.UserLogin.ID, jid.ThreadKey, jid.ThreadJID, int64(jid.ThreadType)); err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to persist hybrid thread mapping")
+		}
 		activeThreads.Add(jid.ThreadJID)
 		innerQueue = append(innerQueue, &simplevent.ChatDelete{
 			EventMeta: simplevent.EventMeta{
@@ -380,6 +299,9 @@ func (m *MetaClient) parseTable(ctx context.Context, tbl *table.LSTable) (innerQ
 		info := m.wrapChatInfo(thread)
 		if fbKey != thread.ThreadKey {
 			info.ExtraUpdates = bridgev2.MergeExtraUpdaters(info.ExtraUpdates, setFBThreadKey(fbKey))
+			if err := m.Main.DB.SetHybridThreadMessageRequest(ctx, m.UserLogin.ID, fbKey, thread.FolderName == folderPending); err != nil {
+				zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to persist hybrid message request status")
+			}
 		}
 		threadResyncs[thread.ThreadKey] = &FBChatResync{
 			PortalKey: m.makeFBPortalKey(thread.ThreadKey, thread.ThreadType),
@@ -400,6 +322,9 @@ func (m *MetaClient) parseTable(ctx context.Context, tbl *table.LSTable) (innerQ
 		info := m.wrapChatInfo(thread)
 		if fbKey != thread.ThreadKey {
 			info.ExtraUpdates = bridgev2.MergeExtraUpdaters(info.ExtraUpdates, setFBThreadKey(fbKey))
+			if err := m.Main.DB.SetHybridThreadMessageRequest(ctx, m.UserLogin.ID, fbKey, thread.FolderName == folderPending); err != nil {
+				zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to persist hybrid message request status")
+			}
 		}
 		threadResyncs[thread.ThreadKey] = &FBChatResync{
 			PortalKey: m.makeFBPortalKey(thread.ThreadKey, thread.ThreadType),
@@ -414,6 +339,10 @@ func (m *MetaClient) parseTable(ctx context.Context, tbl *table.LSTable) (innerQ
 
 	// Deleting a thread will cancel all further events, so handle those first
 	collectPortalEvents(params, tbl.LSDeleteThread, m.handleDeleteThread, &innerQueue)
+	// Facebook's web client uses this procedure when deleting a chat for the current user.
+	collectPortalEvents(params, tbl.LSDeletePartialThread, m.handleDeletePartialThread, &innerQueue)
+	// Same as above, but for deleting/declining a pending message request
+	collectPortalEvents(params, tbl.LSDeleteMessageRequest, m.handleDeleteMessageRequest, &innerQueue)
 	// Similar to above - delete the thread when the user leaves it
 	collectPortalEvents(params, tbl.LSRemoveParticipantFromThread, m.handleSelfLeaveThread, &innerQueue)
 
@@ -562,6 +491,9 @@ func (m *MetaClient) wrapMessageDeleteNotice(tk handlerParams, messageID string)
 func (m *MetaClient) handleDeleteThenInsertMessageRequest(tk handlerParams, msg *table.LSDeleteThenInsertMessageRequest) bridgev2.RemoteEvent {
 	// Status 1 means the thread is in the pending/message request folder.
 	isMessageRequest := msg.MessageRequestStatus == 1
+	if err := m.Main.DB.SetHybridThreadMessageRequest(tk.ctx, m.UserLogin.ID, msg.ThreadKey, isMessageRequest); err != nil {
+		zerolog.Ctx(tk.ctx).Warn().Err(err).Msg("Failed to persist hybrid message request status")
+	}
 	if tk.Sync != nil {
 		if tk.Sync.Raw != nil && tk.Sync.Raw.FolderName == folderSpam {
 			return nil
@@ -569,7 +501,7 @@ func (m *MetaClient) handleDeleteThenInsertMessageRequest(tk handlerParams, msg 
 		tk.Sync.Info.MessageRequest = ptr.Ptr(isMessageRequest)
 		return nil
 	}
-	return m.wrapChatInfoChange(msg.ThreadKey, 0, tk.Type, &bridgev2.ChatInfoChange{
+	return m.wrapChatInfoChange(tk.ID, 0, tk.Type, &bridgev2.ChatInfoChange{
 		ChatInfo: &bridgev2.ChatInfo{
 			MessageRequest: ptr.Ptr(isMessageRequest),
 		},
@@ -597,7 +529,26 @@ func (m *MetaClient) handleDeleteThreadKey(tk handlerParams, threadKey int64, on
 }
 
 func (m *MetaClient) handleDeleteThread(tk handlerParams, msg *table.LSDeleteThread) bridgev2.RemoteEvent {
-	return m.handleDeleteThreadKey(tk, msg.ThreadKey, false /* OnlyForMe */)
+	return m.handleDeleteThreadKey(tk, tk.ID, false /* OnlyForMe */)
+}
+
+func (m *MetaClient) handleDeletePartialThread(tk handlerParams, msg *table.LSDeletePartialThread) bridgev2.RemoteEvent {
+	if tk.Type == table.UNKNOWN_THREAD_TYPE {
+		threadJID, threadType, err := m.Main.DB.GetHybridThreadJID(tk.ctx, m.UserLogin.ID, msg.ThreadKey)
+		if err != nil {
+			zerolog.Ctx(tk.ctx).Warn().Err(err).Int64("thread_key", msg.ThreadKey).
+				Msg("Failed to get persisted hybrid thread mapping")
+		} else if threadJID != 0 {
+			tk.ID = threadJID
+			tk.Type = table.ThreadType(threadType)
+			tk.Portal = m.makeFBPortalKey(threadJID, tk.Type)
+		}
+	}
+	return m.handleDeleteThreadKey(tk, tk.ID, true /* OnlyForMe */)
+}
+
+func (m *MetaClient) handleDeleteMessageRequest(tk handlerParams, msg *table.LSDeleteMessageRequest) bridgev2.RemoteEvent {
+	return m.handleDeleteThreadKey(tk, tk.ID, false /* OnlyForMe */)
 }
 
 func markPortalAsEncrypted(ctx context.Context, portal *bridgev2.Portal) bool {

@@ -33,6 +33,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"go.mau.fi/mautrix-meta/pkg/instameow"
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
 	"go.mau.fi/mautrix-meta/pkg/messagix/methods"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
@@ -77,28 +78,43 @@ func (ic *IGClient) fetchIGIDs(ctx context.Context, portal *bridgev2.Portal) err
 	if fbid == 0 {
 		return fmt.Errorf("invalid portal ID")
 	}
-	resp, err := ic.Client.FetchThreadIDs(ctx, fbid)
+	res, err := ic.fetchIGIDsDirect(ctx, fbid)
 	if err != nil {
-		return fmt.Errorf("failed to fetch IGIDs: %w", err)
-	}
-	res, ok := resp[fbid]
-	if !ok {
-		return fmt.Errorf("server didn't return route definition for %d", fbid)
-	} else if res == nil {
-		return fmt.Errorf("server returned nil route definition for %d", fbid)
-	}
-	err = ic.Main.DB.PutFBIDForIGThread(ctx, res.LongID, fbid, ic.UserLogin.ID)
-	if err != nil {
-		return fmt.Errorf("failed to save IG thread ID mapping %s<->%d: %w", res.LongID, fbid, err)
-	}
-	err = ic.Main.DB.PutFBIDForIGChat(ctx, res.ShortID, fbid, ic.UserLogin.ID)
-	if err != nil {
-		return fmt.Errorf("failed to save IG chat ID mapping %s<->%d: %w", res.ShortID, fbid, err)
+		return err
 	}
 	meta := portal.Metadata.(*metaid.PortalMetadata)
 	meta.IGThreadID = res.LongID
 	meta.IGID = res.ShortID
 	return nil
+}
+
+func (ic *IGClient) ensureIGIDDirect(ctx context.Context, fbid int64) (string, error) {
+	igid, err := ic.Main.DB.GetIGChatForFBID(ctx, fbid, ic.UserLogin.ID)
+	if err != nil {
+		return "", err
+	} else if igid != "" {
+		return igid, nil
+	} else if ids, err := ic.fetchIGIDsDirect(ctx, fbid); err != nil {
+		return "", err
+	} else {
+		return ids.ShortID, nil
+	}
+}
+
+func (ic *IGClient) fetchIGIDsDirect(ctx context.Context, fbid int64) (*instameow.ThreadIGIDs, error) {
+	res, err := ic.Client.FetchThreadID(ctx, fbid)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch IGIDs: %w", err)
+	}
+	err = ic.Main.DB.PutFBIDForIGThread(ctx, res.LongID, fbid, ic.UserLogin.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to save IG thread ID mapping %s<->%d: %w", res.LongID, fbid, err)
+	}
+	err = ic.Main.DB.PutFBIDForIGChat(ctx, res.ShortID, fbid, ic.UserLogin.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to save IG chat ID mapping %s<->%d: %w", res.ShortID, fbid, err)
+	}
+	return res, nil
 }
 
 func (ic *IGClient) ensureIGID(ctx context.Context, portal *bridgev2.Portal) (*metaid.PortalMetadata, error) {
@@ -121,7 +137,9 @@ func (ic *IGClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matri
 		return nil, bridgev2.ErrNotLoggedIn
 	}
 	_, err := ic.ensureIGID(ctx, msg.Portal)
-	if err != nil {
+	if errors.Is(err, instameow.ErrThreadNotFound) && msg.Content.MsgType == event.MsgText && msg.Portal.RoomType == database.RoomTypeDM {
+		// Allow sending text DMs even if the thread isn't known
+	} else if err != nil {
 		return nil, err
 	}
 	log := zerolog.Ctx(ctx)
@@ -331,8 +349,10 @@ func (ic *IGClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridge
 
 func (ic *IGClient) HandleMatrixDeleteChat(ctx context.Context, chat *bridgev2.MatrixDeleteChat) error {
 	meta, err := ic.ensureIGID(ctx, chat.Portal)
-	if err != nil {
-		// TODO treat 404 as success? (thread already deleted)
+	if errors.Is(err, instameow.ErrThreadNotFound) {
+		zerolog.Ctx(ctx).Debug().Err(err).Msg("Ignoring thread not found error on delete chat request")
+		return nil
+	} else if err != nil {
 		return err
 	}
 

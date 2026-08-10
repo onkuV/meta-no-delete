@@ -76,6 +76,13 @@ func NewSocket(opts SocketOptions) *Socket {
 	return s
 }
 
+func (s *Socket) IsConnected() bool {
+	if s == nil {
+		return false
+	}
+	return s.conn.Load() != nil
+}
+
 func (s *Socket) rawNextStreamID() (streamID StreamID, overflow bool) {
 	placeholderID := s.nextStreamID.Add(1) - 1
 	if placeholderID > MaxStreamID {
@@ -111,7 +118,7 @@ type StreamInit struct {
 	FrameHandler FrameHandler
 }
 
-func (s *Socket) DoOneOffStream(ctx context.Context, payload []byte) ([]byte, error) {
+func (s *Socket) DoOneOffStream(ctx context.Context, payload []byte, noAckOrData bool) ([]byte, error) {
 	conn := s.conn.Load()
 	if conn == nil {
 		return nil, ErrSocketNotOpen
@@ -121,7 +128,7 @@ func (s *Socket) DoOneOffStream(ctx context.Context, payload []byte) ([]byte, er
 		s.sendFatalError(err)
 		return nil, err
 	}
-	oos := newOneOffStream(conn, streamID, &s.Log)
+	oos := newOneOffStream(conn, streamID, &s.Log, noAckOrData)
 	_, replaced := s.streams.Swap(streamID, oos)
 	if replaced {
 		err = fmt.Errorf("dgw: stream ID collision on %d", streamID)
@@ -290,13 +297,17 @@ func (s *Socket) readLoop(ctx context.Context, conn *websocket.Conn) error {
 		for {
 			select {
 			case frame := <-incoming:
-				if frame.f == nil {
+				if frame.s == nil {
 					return
 				}
-				err := frame.s.receiveFrame(ctx, frame.f)
-				if err != nil {
-					fatalError(fmt.Errorf("dgw: frame handler error: %w", err))
-					return
+				if frame.f != nil {
+					err := frame.s.receiveFrame(ctx, frame.f)
+					if err != nil {
+						fatalError(fmt.Errorf("dgw: frame handler error: %w", err))
+						return
+					}
+				} else {
+					frame.s.close()
 				}
 			case <-done:
 				return
@@ -346,11 +357,15 @@ func (s *Socket) readLoop(ctx context.Context, conn *websocket.Conn) error {
 				s.Log.Debug().Uint16("stream_id", uint16(f.StreamID)).Msg("Received end of data frame for unknown stream")
 			} else {
 				s.Log.Debug().Uint16("stream_id", uint16(f.StreamID)).Msg("Received end of data frame")
-				stream.close()
+				incoming <- wrappedDataFrame{
+					s: stream,
+				}
 				s.streams.Delete(f.StreamID)
 			}
 		case *DrainFrame:
 			s.Log.Debug().Stringer("reason", f.DrainReason).Msg("Received drain frame")
+		case *DeauthFrame:
+			s.Log.Debug().Msg("Received deauth frame")
 		case *UnsupportedFrame:
 			s.Log.Warn().
 				Stringer("frame_type", FrameType(f.Raw[0])).
@@ -370,6 +385,10 @@ func (s *Socket) readLoop(ctx context.Context, conn *websocket.Conn) error {
 			msgtype, data, err := conn.Read(ctx)
 			if err != nil {
 				fatalError(fmt.Errorf("dgw: reading message: %w", err))
+				// Close status errors are the best, so force them to overwrite any other errors
+				if websocket.CloseStatus(err) > 0 {
+					s.err.Store(&err)
+				}
 				return
 			} else if msgtype != websocket.MessageBinary {
 				s.Log.Warn().
@@ -475,7 +494,7 @@ func (s *Socket) getConnURL() string {
 	} else {
 		query.Add("x-dgw-authtype", "6:0")
 	}
-	query.Add("x-dgw-version", "5")
+	query.Add("x-dgw-version", "5") // DGWVER_BIG_IDS
 	query.Add("x-dgw-uuid", s.UserID)
 	query.Add("x-dgw-tier", "prod")
 	if s.LoggingID {
