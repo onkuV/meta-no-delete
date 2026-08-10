@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -32,41 +33,42 @@ import (
 	"maunium.net/go/mautrix/event"
 
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
+	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
 )
 
 const (
-	DGWConnectionError         status.BridgeStateErrorCode = "ig-dgw-connection-error"
-	MetaConnectionUnauthorized status.BridgeStateErrorCode = "meta-connection-unauthorized"
-	MetaCookieRemoved          status.BridgeStateErrorCode = "meta-cookie-removed"
-	MetaUserIDIsZero           status.BridgeStateErrorCode = "meta-user-id-is-zero"
-	MetaRedirectedToLoginPage  status.BridgeStateErrorCode = "meta-redirected-to-login"
-	MetaNotLoggedIn            status.BridgeStateErrorCode = "meta-not-logged-in"
-	MetaConnectError           status.BridgeStateErrorCode = "meta-connect-error"
-	MetaGraphQLError           status.BridgeStateErrorCode = "meta-graphql-error"
-	IGChallengeRequired        status.BridgeStateErrorCode = "ig-challenge-required"
-	IGAccountSuspended         status.BridgeStateErrorCode = "ig-account-suspended"
-	IGConsentRequired          status.BridgeStateErrorCode = "ig-consent-required"
-	FBCheckpointRequired       status.BridgeStateErrorCode = "fb-checkpoint-required"
-	MetaProxyUpdateFail        status.BridgeStateErrorCode = "meta-proxy-update-fail"
-	MetaNotInstagram           status.BridgeStateErrorCode = "meta-not-instagram-account"
+	DGWConnectionError        status.BridgeStateErrorCode = "ig-dgw-connection-error"
+	DGWConnectionUnauthorized status.BridgeStateErrorCode = "dgw-connection-unauthorized"
+	MetaCookieRemoved         status.BridgeStateErrorCode = "meta-cookie-removed"
+	MetaUserIDIsZero          status.BridgeStateErrorCode = "meta-user-id-is-zero"
+	MetaRedirectedToLoginPage status.BridgeStateErrorCode = "meta-redirected-to-login"
+	MetaNotLoggedIn           status.BridgeStateErrorCode = "meta-not-logged-in"
+	MetaConnectError          status.BridgeStateErrorCode = "meta-connect-error"
+	MetaGraphQLError          status.BridgeStateErrorCode = "meta-graphql-error"
+	IGChallengeRequired       status.BridgeStateErrorCode = "ig-challenge-required"
+	IGAccountSuspended        status.BridgeStateErrorCode = "ig-account-suspended"
+	IGConsentRequired         status.BridgeStateErrorCode = "ig-consent-required"
+	FBCheckpointRequired      status.BridgeStateErrorCode = "fb-checkpoint-required"
+	MetaProxyUpdateFail       status.BridgeStateErrorCode = "meta-proxy-update-fail"
+	MetaNotInstagram          status.BridgeStateErrorCode = "meta-not-instagram-account"
 )
 
 func init() {
 	status.BridgeStateHumanErrors.Update(status.BridgeStateErrorMap{
-		DGWConnectionError:         "Disconnected from server, trying to reconnect",
-		MetaConnectionUnauthorized: "Logged out, please relogin to continue",
-		MetaCookieRemoved:          "Logged out, please relogin to continue",
-		MetaUserIDIsZero:           "Logged out, please relogin to continue",
-		MetaRedirectedToLoginPage:  "Logged out, please relogin to continue",
-		MetaNotLoggedIn:            "Logged out, please relogin to continue",
-		IGAccountSuspended:         "Logged out, please check the Instagram website to continue",
-		IGChallengeRequired:        "Challenge required, please check the Instagram website to continue",
-		IGConsentRequired:          "Consent required, please check the Instagram website to continue",
-		FBCheckpointRequired:       "Checkpoint required, please check the Facebook website to continue",
-		MetaConnectError:           "Unknown connection error",
-		MetaProxyUpdateFail:        "Failed to update proxy",
-		MetaNotInstagram:           "Non-Instagram login present on Instagram-only bridge",
+		DGWConnectionError:        "Disconnected from server, trying to reconnect",
+		DGWConnectionUnauthorized: "Logged out, please relogin to continue",
+		MetaCookieRemoved:         "Logged out, please relogin to continue",
+		MetaUserIDIsZero:          "Logged out, please relogin to continue",
+		MetaRedirectedToLoginPage: "Logged out, please relogin to continue",
+		MetaNotLoggedIn:           "Logged out, please relogin to continue",
+		IGAccountSuspended:        "Logged out, please check the Instagram website to continue",
+		IGChallengeRequired:       "Challenge required, please check the Instagram website to continue",
+		IGConsentRequired:         "Consent required, please check the Instagram website to continue",
+		FBCheckpointRequired:      "Checkpoint required, please check the Facebook website to continue",
+		MetaConnectError:          "Unknown connection error",
+		MetaProxyUpdateFail:       "Failed to update proxy",
+		MetaNotInstagram:          "Non-Instagram login present on Instagram-only bridge",
 	})
 }
 
@@ -86,6 +88,7 @@ func (ic *IGClient) doWaitMailboxProcessed(ctx context.Context) error {
 func (ic *IGClient) handleIGEvent(ctx context.Context, rawEvt slidetypes.ClientEvent) error {
 	switch evt := rawEvt.(type) {
 	case *slidetypes.Connected:
+		ic.permanentErrored.Store(false)
 		ic.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 		if evt.SubscribedSeqID >= evt.LatestSeqID {
 			ic.catchingUpTo = 0
@@ -101,13 +104,31 @@ func (ic *IGClient) handleIGEvent(ctx context.Context, rawEvt slidetypes.ClientE
 		}
 		return nil
 	case *slidetypes.Disconnected:
+		stateEvt := status.StateTransientDisconnect
+		errCode := DGWConnectionError
+		var retErr error
+		if websocket.CloseStatus(evt.Error) == dgw.CloseStatusUnauthorized {
+			// TODO do full reconnect instead of this?
+			stateEvt = status.StateBadCredentials
+			errCode = DGWConnectionUnauthorized
+			retErr = fmt.Errorf("connection unauthorized; stop reconnects")
+			ic.permanentErrored.Store(true)
+		}
 		ic.UserLogin.BridgeState.Send(status.BridgeState{
-			StateEvent: status.StateTransientDisconnect,
-			Error:      DGWConnectionError,
+			StateEvent: stateEvt,
+			Error:      errCode,
 			Info: map[string]any{
 				"go_error": evt.Error.Error(),
 			},
 		})
+		return retErr
+	case *slidetypes.AuthError:
+		if state := ic.errorToBridgeState(ctx, evt.Error); state != nil {
+			ic.UserLogin.Log.Warn().Err(evt.Error).Msg("Got auth error event from request failing")
+			ic.UserLogin.BridgeState.Send(*state)
+		} else {
+			ic.UserLogin.Log.Warn().Err(evt.Error).Msg("Got unrecognized auth error event")
+		}
 		return nil
 	case *slidetypes.SeqIDUpdate:
 		_ = ic.doWaitMailboxProcessed(ctx)
@@ -224,10 +245,24 @@ func (ic *IGClient) handleDelta(ctx context.Context, d *slidetypes.Delta) error 
 		Msg("Handling delta")
 
 	allowCreate := true
-	switch d.Data.(type) {
+	switch evt := d.Data.(type) {
 	case *slidetypes.DeleteThreadEvent, *slidetypes.DeleteMessageEvent, *slidetypes.DeleteReactionEvent,
 		*slidetypes.ParticipantLeaveEvent:
 		allowCreate = false
+	case *slidetypes.NewMessageEvent:
+		// Some messages (maybe specifically raven messages?) don't have the top-level thread ID set,
+		// so extract it from the message for finding the portal.
+		if d.ThreadIGID == "" && evt.Message != nil && evt.Message.ThreadFBID != "" {
+			d.ThreadIGID = evt.Message.ThreadFBID
+		}
+	case *slidetypes.AdminMessageEvent:
+		if ic.pendingGroupCreations.Has(evt.Message.OfflineThreadingID) {
+			log.Debug().
+				Str("offline_threading_id", evt.Message.OfflineThreadingID).
+				Str("thread_id", d.ThreadIGID).
+				Msg("Ignoring create notice for pending creation")
+			return nil
+		}
 	}
 
 	portalKey, didResync, err := ic.ensurePortal(ctx, d.ThreadIGID, allowCreate)
@@ -313,15 +348,38 @@ func (ic *IGClient) makeMessageEventMeta(portalKey networkid.PortalKey, msg *sli
 
 func (ic *IGClient) handleMessage(portalKey networkid.PortalKey, msg *slidetypes.Message) bridgev2.EventHandlingResult {
 	msgID := metaid.MakeFBMessageID(msg.ID)
+	ic.updateGhostFromEvent(msg.Sender)
 	return ic.UserLogin.QueueRemoteEvent(&simplevent.Message[*slidetypes.Message]{
 		EventMeta: ic.makeMessageEventMeta(portalKey, msg, bridgev2.RemoteEventMessage),
 		//TransactionID: msg.OfflineThreadingID,
 		Data: msg,
 		ID:   msgID,
 		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *slidetypes.Message) (*bridgev2.ConvertedMessage, error) {
-			return ic.Main.MsgConv.ToMatrix(ctx, portal, ic.Client, intent, msgID, data, ic.Main.Config.DisableXMAAlways), ctx.Err()
+			return ic.Main.MsgConv.ToMatrix(ctx, portal, ic.Client, ic.UserLogin, intent, msgID, data, ic.Main.Config.DisableXMAAlways), ctx.Err()
 		},
 	})
+}
+
+func (ic *IGClient) updateGhostFromEvent(sender *slidetypes.MessageSender) {
+	if sender == nil || sender.UserDict.InteropMessagingUserFBID == 0 {
+		return
+	}
+	log := ic.UserLogin.Log.With().
+		Str("action", "update ghost from event").
+		Int64("user_id", sender.UserDict.InteropMessagingUserFBID).
+		Logger()
+	ctx := log.WithContext(ic.Main.Bridge.BackgroundCtx)
+	ghost, err := ic.Main.Bridge.GetGhostByID(ctx, metaid.MakeUserID(sender.UserDict.InteropMessagingUserFBID))
+	if err != nil {
+		log.Err(err).Msg("Failed to get ghost")
+		return
+	}
+	if ghost.Name == "" {
+		ghost.UpdateInfo(ctx, ic.wrapUserInfo(&sender.UserDict))
+	} else {
+		// Already have a name, do update in background
+		go ghost.UpdateInfo(ctx, ic.wrapUserInfo(&sender.UserDict))
+	}
 }
 
 func (ic *IGClient) handleEdit(portalKey networkid.PortalKey, evt *slidetypes.EditMessageEvent) bridgev2.EventHandlingResult {
@@ -334,8 +392,8 @@ func (ic *IGClient) handleEdit(portalKey networkid.PortalKey, evt *slidetypes.Ed
 			Timestamp:   evt.SlideEditHistoryEntry.TimestampMS.Time,
 			StreamOrder: evt.SlideEditHistoryEntry.TimestampMS.UnixMilli(),
 		},
-		Data: evt.TextBody,
-		ID:   msgID,
+		Data:          evt.TextBody,
+		TargetMessage: msgID,
 		ConvertEditFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message, newText string) (*bridgev2.ConvertedEdit, error) {
 			if len(existing) == 0 {
 				return nil, fmt.Errorf("no existing message found for edit event %s", msgID)

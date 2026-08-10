@@ -44,6 +44,7 @@ type MetaClient struct {
 	backfillLock        sync.Mutex
 	connectLock         sync.Mutex
 	stopConnectAttempt  atomic.Pointer[context.CancelFunc]
+	permanentErrored    atomic.Bool
 
 	editChannels *exsync.Map[string, chan *FBEditEvent]
 
@@ -73,7 +74,6 @@ type MetaClient struct {
 
 func (m *MetaConnector) getMessagixConfig() *messagix.Config {
 	return &messagix.Config{
-		MayConnectToDGW:          m.Config.ReceiveInstagramTypingIndicators,
 		ClientSettings:           m.Bridge.GetHTTPClientSettings(),
 		LogRedactedBloksPayloads: m.Config.LogRedactedBloksPayloads,
 	}
@@ -169,9 +169,7 @@ func (m *MetaClient) Connect(ctx context.Context) {
 	if m.metaState.StateEvent == "" && m.waState.StateEvent == "" {
 		// Ensure both states start at CONNECTING now
 		m.metaState.StateEvent = status.StateConnecting
-		if m.LoginMeta.Platform.IsMessenger() {
-			m.waState.StateEvent = status.StateConnecting
-		}
+		m.waState.StateEvent = status.StateConnecting
 		m.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
 	}
 	retryCtx, cancel := context.WithCancel(ctx)
@@ -185,6 +183,13 @@ func (m *MetaClient) Connect(ctx context.Context) {
 const MaxConnectRetries = 10
 
 func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts int) {
+	if m.LoginMeta.Platform == types.Instagram {
+		m.UserLogin.BridgeState.Send(status.BridgeState{
+			StateEvent: status.StateBadCredentials,
+			Error:      IGNotSupported,
+		})
+		return
+	}
 	m.ensureMessagixClient()
 	cli := m.Client
 	if cli == nil {
@@ -233,6 +238,7 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 		}
 	}
 	m.initialTableHandled.Store(false)
+	m.permanentErrored.Store(false)
 	currentUser, initialTable, err := cli.LoadMessagesPage(ctx)
 	if err != nil {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to load messages page")
@@ -257,15 +263,17 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 				zerolog.Ctx(ctx).Err(err).Msg("Failed to save user login after clearing cookies")
 			}
 		} else if errors.Is(err, httpclient.ErrChallengeRequired) {
+			// Note: this is probably exclusive to instagram
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
-				Error:      IGChallengeRequired,
+				Error:      FBChallengeRequired,
 				UserAction: status.UserActionRestart,
 			})
 		} else if errors.Is(err, httpclient.ErrAccountSuspended) {
+			// Note: this is probably exclusive to instagram
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
-				Error:      IGAccountSuspended,
+				Error:      FBAccountSuspended,
 			})
 		} else if errors.Is(err, httpclient.ErrCheckpointRequired) {
 			m.UserLogin.BridgeState.Send(status.BridgeState{
@@ -274,13 +282,9 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 				UserAction: status.UserActionRestart,
 			})
 		} else if errors.Is(err, httpclient.ErrConsentRequired) {
-			code := IGConsentRequired
-			if m.LoginMeta.Platform.IsMessenger() {
-				code = FBConsentRequired
-			}
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
-				Error:      code,
+				Error:      FBConsentRequired,
 				UserAction: status.UserActionRestart,
 			})
 		} else if lsErr := (&types.ErrorResponse{}); errors.As(err, &lsErr) {
@@ -332,6 +336,7 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 func (m *MetaClient) connectWithTable(ctx context.Context, initialTable *table.LSTable, currentUser types.UserInfo) {
 	zerolog.Ctx(ctx).Debug().Msg("Loaded messages page, connecting to MQTT with initial table")
 	go m.handleTableLoop(ctx)
+	m.permanentErrored.Store(false)
 
 	var err error
 	m.Ghost, err = m.Main.Bridge.GetGhostByID(ctx, networkid.UserID(m.UserLogin.ID))
@@ -345,13 +350,6 @@ func (m *MetaClient) connectWithTable(ctx context.Context, initialTable *table.L
 	}
 	m.UserLogin.RemoteName = currentUser.GetName()
 	m.UserLogin.RemoteProfile.Name = currentUser.GetName()
-	if !m.LoginMeta.Platform.IsMessenger() {
-		m.UserLogin.RemoteProfile.Username = currentUser.GetUsername()
-		// Instagram users may not have a displayname
-		if m.UserLogin.RemoteName == "" {
-			m.UserLogin.RemoteName = currentUser.GetUsername()
-		}
-	}
 	m.UserLogin.RemoteProfile.Avatar = m.Ghost.AvatarMXC
 
 	m.initialTable.Store(initialTable)
@@ -537,6 +535,7 @@ func (m *MetaClient) Disconnect() {
 }
 
 func (m *MetaClient) disconnect(dumpState bool) (state json.RawMessage) {
+	m.permanentErrored.Store(false)
 	if stopConnectAttempt := m.stopConnectAttempt.Swap(nil); stopConnectAttempt != nil {
 		(*stopConnectAttempt)()
 	}
@@ -566,7 +565,7 @@ func (m *MetaClient) disconnect(dumpState bool) (state json.RawMessage) {
 }
 
 func (m *MetaClient) IsLoggedIn() bool {
-	return m.Client.IsAuthenticatedAndLoaded()
+	return m.Client.IsAuthenticatedAndLoaded() && !m.permanentErrored.Load()
 }
 
 func (m *MetaClient) IsThisUser(ctx context.Context, userID networkid.UserID) bool {
@@ -592,6 +591,7 @@ func (m *MetaClient) canReconnect() bool {
 	return time.Since(m.lastFullReconnect) > time.Duration(m.Main.Config.MinFullReconnectIntervalSeconds)*time.Second && m.LoginMeta.Cookies != nil
 }
 
+//lint:ignore U1000 pending re-reversing of disconnect codes
 func (m *MetaClient) canReconnectError24() bool {
 	if !m.canReconnect() && time.Since(m.lastError24Reconnect) < 10*time.Minute {
 		return false

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exhttp"
 	"go.mau.fi/util/exsync"
@@ -16,6 +17,7 @@ import (
 	"go.mau.fi/whatsmeow/store"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
+	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
 	"go.mau.fi/mautrix-meta/pkg/messagix/endpoints"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
@@ -28,7 +30,6 @@ var ErrClientIsNil = whatsmeow.ErrClientIsNil
 type EventHandler func(ctx context.Context, evt any)
 
 type Config struct {
-	MayConnectToDGW          bool
 	ClientSettings           exhttp.ClientSettings
 	LogRedactedBloksPayloads bool
 }
@@ -36,19 +37,22 @@ type Config struct {
 type Client struct {
 	http *httpclient.HTTPClient
 
-	Instagram     *InstagramMethods
 	Facebook      *FacebookMethods
 	MessengerLite *MessengerLiteMethods
 	Logger        zerolog.Logger
 	Platform      types.Platform
 
-	socket       *Socket
+	socket             *dgw.Socket
+	socketWasSynced    atomic.Bool
+	socketWasConnected atomic.Bool
+	packetsSent        atomic.Uint32
+	socketSyncWaiters  *exsync.Map[int64, chan *PublishResponseData]
+
 	eventHandler EventHandler
 	configs      *httpclient.Configs
 	syncManager  *SyncManager
 
-	cookies         *cookies.Cookies
-	mayConnectToDGW bool
+	cookies *cookies.Cookies
 
 	device *store.Device
 
@@ -75,6 +79,7 @@ func NewClient(cookies *cookies.Cookies, logger zerolog.Logger, cfg *Config) *Cl
 		Platform:              cookies.Platform,
 		connectionLoopStopped: exsync.NewEvent(),
 		canSendMessages:       exsync.NewEvent(),
+		socketSyncWaiters:     exsync.NewMap[int64, chan *PublishResponseData](),
 	}
 	cli.configs = httpclient.NewConfigs(cli)
 	cli.http = httpclient.NewHTTPClient(cli, cli.configs, cfg.ClientSettings)
@@ -83,8 +88,18 @@ func NewClient(cookies *cookies.Cookies, logger zerolog.Logger, cfg *Config) *Cl
 	cli.connectionLoopStopped.Set()
 
 	cli.configurePlatformClient()
-	cli.socket = cli.newSocketClient()
-	cli.mayConnectToDGW = cfg.MayConnectToDGW
+	cli.socket = dgw.NewSocket(dgw.SocketOptions{
+		GetCookies: func() string {
+			return cli.GetCookies().String()
+		},
+		OnConnect: cli.onSocketConnect,
+		Origin:    cli.GetEndpoint("base_url"),
+		WSURL:     cli.GetEndpoint("dgw_lightspeed"),
+		DialOpts:  *cli.http.GetWebsocketDialer(),
+		Log:       logger.With().Str("socket", "main").Logger(),
+		Facebook:  true,
+		LoggingID: true,
+	})
 
 	return cli
 }
@@ -112,14 +127,13 @@ type dumpedState struct {
 }
 
 func (c *Client) DumpState() (json.RawMessage, error) {
-	if c == nil || c.configs == nil || c.syncManager == nil || c.socket == nil || c.socket.packetsSent == 0 || !c.socket.previouslyConnected {
+	if c == nil || c.configs == nil || c.syncManager == nil || c.socket == nil || !c.socketWasSynced.Load() {
 		return nil, nil
 	}
 	return json.Marshal(&dumpedState{
 		Configs:     c.configs,
 		SyncStore:   c.syncManager.store,
-		PacketsSent: c.socket.packetsSent,
-		SessionID:   c.socket.sessionID,
+		PacketsSent: uint16(c.packetsSent.Load()),
 		Timestamp:   time.Now(),
 	})
 }
@@ -142,15 +156,10 @@ func (c *Client) LoadState(state json.RawMessage) error {
 	c.configs = dumped.Configs
 	c.syncManager = c.newSyncManager()
 	c.syncManager.store = dumped.SyncStore
-	c.socket.packetsSent = dumped.PacketsSent
-	c.socket.sessionID = dumped.SessionID
-	if c.Platform == types.Instagram {
-		c.socket.broker = "wss://edge-chat.instagram.com/chat?"
-	} else {
-		c.socket.broker = c.configs.BrowserConfigTable.MqttWebConfig.Endpoint
-	}
-	c.socket.previouslyConnected = true
-	c.Logger.Info().Int64("session_id", c.socket.sessionID).Msg("Loaded state")
+	c.updateSocketIDs()
+	c.packetsSent.Store(uint32(dumped.PacketsSent))
+	c.socketWasSynced.Store(true)
+	c.Logger.Info().Msg("Loaded state")
 	return nil
 }
 
@@ -172,12 +181,7 @@ func (c *Client) LoadMessagesPage(ctx context.Context) (types.UserInfo, *table.L
 	if err != nil {
 		return nil, nil, err
 	}
-	var currentUser types.UserInfo
-	if c.Platform.IsMessenger() {
-		currentUser = &c.configs.BrowserConfigTable.CurrentUserInitialData
-	} else {
-		currentUser = &c.configs.BrowserConfigTable.PolarisViewer
-	}
+	currentUser := &c.configs.BrowserConfigTable.CurrentUserInitialData
 	return currentUser, ls, nil
 }
 
@@ -200,13 +204,14 @@ func (c *Client) configurePlatformClient() {
 	case types.Messenger:
 		selectedEndpoints = endpoints.MessengerEndpoints
 		c.Facebook = &FacebookMethods{client: c}
-	case types.MessengerLite:
-		selectedEndpoints = endpoints.MessengerLiteEndpoints
+	case types.MessengerLiteIOS:
+		selectedEndpoints = endpoints.MessengerLiteIOSEndpoints
 		c.Facebook = &FacebookMethods{client: c}
 		c.MessengerLite = &MessengerLiteMethods{client: c}
-	case types.Instagram:
-		selectedEndpoints = endpoints.InstagramEndpoints
-		c.Instagram = &InstagramMethods{client: c}
+	case types.MessengerLiteAndroid:
+		selectedEndpoints = endpoints.MessengerLiteAndroidEndpoints
+		c.Facebook = &FacebookMethods{client: c}
+		c.MessengerLite = &MessengerLiteMethods{client: c}
 	}
 
 	c.endpoints = selectedEndpoints
@@ -228,8 +233,10 @@ func (c *Client) HandleEvent(ctx context.Context, evt any) {
 func (c *Client) Connect(ctx context.Context) error {
 	if c == nil {
 		return ErrClientIsNil
-	} else if err := c.socket.CanConnect(); err != nil {
-		return err
+	} else if !c.IsAuthenticated() {
+		return fmt.Errorf("messagix-client: not yet authenticated, cannot connect")
+	} else if c.socket.UserID == "0" || c.socket.UserID == "" {
+		return fmt.Errorf("messagix-client: socket not configured with user ID")
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	oldCancel := c.stopCurrentConnections.Swap(&cancel)
@@ -249,6 +256,7 @@ func (c *Client) Connect(ctx context.Context) error {
 			c.canSendMessages.Clear() // In case we're reconnecting from a normal network error
 			connectStart := time.Now()
 			err := c.socket.Connect(ctx)
+			c.clearSocketSyncWaiters()
 			c.canSendMessages.Clear()
 			if ctx.Err() != nil {
 				zerolog.Ctx(ctx).Warn().
@@ -257,19 +265,15 @@ func (c *Client) Connect(ctx context.Context) error {
 					Msg("Context canceled, stopping connection loop")
 				return
 			}
-			if errors.Is(err, CONNECTION_REFUSED_UNAUTHORIZED) ||
-				// TODO server unavailable may mean a challenge state, should be checked somehow
-				errors.Is(err, CONNECTION_REFUSED_SERVER_UNAVAILABLE) ||
-				errors.Is(err, CONNECTION_REFUSED_UNKNOWN_24) {
-				c.HandleEvent(ctx, &Event_PermanentError{Err: err})
-				return
-			} else if errors.Is(err, CONNECTION_REFUSED_BAD_USERNAME_OR_PASSWORD) && connectionAttempts > 5 {
-				// Allow up to 5 reconnects for this error as it does not seem permanent
-				c.HandleEvent(ctx, &Event_PermanentError{Err: err})
+			closeCode := websocket.CloseStatus(err)
+			// TODO determine if this is the correct thing to fail on
+			if closeCode == dgw.CloseStatusUnauthorized {
+				c.Logger.Err(err).Msg("Error in connection, exiting")
+				c.HandleEvent(ctx, &PermanentErrorEvent{Err: err})
 				return
 			}
-			c.HandleEvent(ctx, &Event_SocketError{Err: err, ConnectionAttempts: connectionAttempts})
-			if time.Since(connectStart) > 2*time.Minute && (err == nil || errors.Is(err, socket.ErrInReadLoop)) {
+			c.HandleEvent(ctx, &TransientDisconnectEvent{Err: err, ConnectionAttempts: connectionAttempts})
+			if time.Since(connectStart) > 2*time.Minute && c.socketWasConnected.Load() {
 				// Reconnect immediately after a long successful connection
 				reconnectIn = 0
 				connectionAttempts = 0
@@ -313,7 +317,7 @@ func (c *Client) Disconnect() {
 }
 
 func (c *Client) IsConnected() bool {
-	return c != nil && c.socket.conn != nil
+	return c != nil && c.socket.IsConnected()
 }
 
 func (c *Client) GetEndpoint(name string) string {
@@ -327,13 +331,7 @@ func (c *Client) IsAuthenticated() bool {
 	if c == nil {
 		return false
 	}
-	var isAuthenticated bool
-	if c.Platform.IsMessenger() {
-		isAuthenticated = c.configs.BrowserConfigTable.CurrentUserInitialData.AccountID != "0"
-	} else {
-		isAuthenticated = c.configs.BrowserConfigTable.PolarisViewer.ID != ""
-	}
-	return isAuthenticated
+	return c.configs.BrowserConfigTable.CurrentUserInitialData.AccountID != "0"
 }
 
 func (c *Client) IsAuthenticatedAndLoaded() bool {
@@ -347,11 +345,7 @@ func (c *Client) GetCurrentAccount() (types.UserInfo, error) {
 		return nil, fmt.Errorf("messagix-client: not yet authenticated")
 	}
 
-	if c.Platform.IsMessenger() {
-		return &c.configs.BrowserConfigTable.CurrentUserInitialData, nil
-	} else {
-		return &c.configs.BrowserConfigTable.PolarisViewer, nil
-	}
+	return &c.configs.BrowserConfigTable.CurrentUserInitialData, nil
 }
 
 func (c *Client) getTaskID() int64 {
@@ -380,7 +374,7 @@ func (c *Client) ForceReconnect() {
 	if c == nil {
 		return
 	}
-	c.socket.Disconnect()
+	c.socket.ForceReconnect()
 }
 
 func (c *Client) FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error) {
@@ -409,13 +403,16 @@ func (c *Client) FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket
 		return nil, nil, err
 	}
 
-	resp, err := c.socket.makeLSRequest(ctx, payload, 3)
+	resp, err := c.makeLSRequest(ctx, payload, 3)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	resp.Finish()
-	c.socket.postHandlePublishResponse(resp.Table)
+	tbl, err := resp.Parse(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	c.PostHandlePublishResponse(tbl)
 
-	return keyStore, resp.Table, nil
+	return keyStore, tbl, nil
 }

@@ -44,10 +44,35 @@ var doSMSCode = flag.String("sms-code", "", "Submit SMS code")
 var doBackupCode = flag.String("backup-code", "", "Submit backup code")
 var doEncrypt = flag.String("encrypt", "", "Encrypt a password")
 var deviceID = flag.String("device-id", "", "Device ID for password encryption")
+var familyDeviceID = flag.String("family-device-id", "", "Family device ID for headers")
 var doCaptcha = flag.String("captcha-code", "", "Captcha code to submit")
 var captchaResponse = flag.String("captcha-resp", "", "Bloks response for captcha submission")
 var doWhatsAppNumbers = flag.Bool("whatsapp-numbers", false, "Print the available WhatsApp numbers")
 var selectedWhatsAppNumber = flag.String("whatsapp-number", "", "Pick a WhatsApp number and submit")
+var cancelPasskey = flag.Bool("cancel-passkey", false, "Tap the 'try another way' passkey button")
+var isAndroid = flag.Bool("android", false, "Use Android instead of iOS")
+var doPageFromAction = flag.Bool("new-page", false, "Act on new page rendered by action")
+var exchangeToken = flag.String("exchange-token", "", "Exchange an access token for session cookies (auth/create_session_for_app)")
+var machineID = flag.String("machine-id", "", "Machine ID to send with -exchange-token")
+var sessionEndpoint = flag.String("session-endpoint", "", "Override the create_session_for_app endpoint")
+var newAppID = flag.String("new-app-id", "", "Request the session for this app instead of our own")
+var appAuth = flag.Bool("app-auth", false, "Send the first-party app authorization header with -exchange-token")
+var sweepAppIDs = flag.Bool("sweep-app-ids", false, "Try -exchange-token against every known first-party app ID")
+
+// Known first-party app IDs, for finding one that the session exchange accepts.
+var knownAppIDs = []struct{ ID, Name string }{
+	{"", "ourselves"},
+	{"350685531728", "Facebook Android"},
+	{"6628568379", "Facebook iPhone"},
+	{"275254692598279", "Facebook Lite"},
+	{"256002347743983", "Messenger Android"},
+	{"237759909591655", "Messenger iPhone"},
+	{"200424423651082", "Messenger Lite"},
+	{"437626316973788", "Messenger Lite iOS"},
+	{"165907476854626", "Pages Manager iOS"},
+	{"121876164619130", "Pages Manager Android"},
+	{"124024574287414", "Instagram"},
+}
 
 func main() {
 	err := mainE()
@@ -93,12 +118,17 @@ func mainE() error {
 	log := zerolog.New(zerolog.NewConsoleWriter()).Level(logLevel)
 	ctx = log.WithContext(ctx)
 
+	plat := types.MessengerLiteIOS
+	if *isAndroid {
+		plat = types.MessengerLiteAndroid
+	}
+
 	if *doEncrypt != "" {
 		if *deviceID == "" {
 			return fmt.Errorf("must give -device-id to use -encrypt")
 		}
 		cook := &cookies.Cookies{
-			Platform: types.MessengerLite,
+			Platform: plat,
 		}
 		cl := messagix.NewClient(cook, log, &messagix.Config{
 			ClientSettings: exhttp.SensibleClientSettings,
@@ -108,12 +138,48 @@ func mainE() error {
 		if err != nil {
 			return err
 		}
-		enc, err := crypto.EncryptPassword(int(types.MessengerLite), key.KeyID, key.PublicKey, *doEncrypt)
+		enc, err := crypto.EncryptPassword(plat, key.KeyID, key.PublicKey, *doEncrypt)
 		if err != nil {
 			return err
 		}
 
 		fmt.Println(enc)
+		return nil
+	}
+	if *exchangeToken != "" {
+		cl := messagix.NewClient(&cookies.Cookies{
+			Platform: plat,
+		}, log, &messagix.Config{
+			ClientSettings: exhttp.SensibleClientSettings,
+		})
+		if *deviceID != "" {
+			cl.MessengerLite.SetDeviceIdentifiers(uuid.MustParse(*deviceID))
+		}
+		cl.MessengerLite.SetMachineID(*machineID)
+
+		apps := []struct{ ID, Name string }{{*newAppID, "requested app"}}
+		if *sweepAppIDs {
+			apps = knownAppIDs
+		}
+		for _, app := range apps {
+			resp, err := cl.MessengerLite.GetSessionForApp(ctx, *exchangeToken, messagix.SessionForAppOptions{
+				Endpoint: *sessionEndpoint,
+				NewAppID: app.ID,
+				AppAuth:  *appAuth,
+			})
+			if err != nil {
+				fmt.Printf("%s %s: %v\n", app.ID, app.Name, err)
+				continue
+			}
+			cookieNames := make([]string, len(resp.SessionCookies))
+			for i, cookie := range resp.SessionCookies {
+				cookieNames[i] = cookie.Name
+			}
+			fmt.Printf("%s %s: uid=%s cookies=[%s]\n", app.ID, app.Name, resp.UID, strings.Join(cookieNames, " "))
+			// The token may well be single use, so don't keep going once
+			// something has worked.
+			break
+		}
 		return nil
 	}
 	if *doRPC != "" {
@@ -134,9 +200,13 @@ func mainE() error {
 		}
 
 		mcl := messagix.NewClient(&cookies.Cookies{
-			Platform: types.MessengerLite,
+			Platform: plat,
 		}, log, &messagix.Config{})
-		mcl.GetHTTP().MakeBloksRequest(ctx, &bloks.BloksAppDoc, bloks.NewBloksRequest(*doRPC, paramsInner))
+		doc, err := bloks.GetBloksAppDoc(plat)
+		if err != nil {
+			return err
+		}
+		mcl.GetHTTP().MakeBloksRequest(ctx, doc, *doRPC, paramsInner, *deviceID, *familyDeviceID)
 
 		return nil
 	}
@@ -148,25 +218,6 @@ func mainE() error {
 	bundle, err := readAndParse[bloks.BloksBundle](*filename)
 	if err != nil {
 		return err
-	}
-	if *doPrint {
-		return bundle.Print(os.Stdout, "")
-	}
-	if *doRedact {
-		bundle.Redact()
-		return bundle.Print(os.Stdout, "")
-	}
-	if *doExport {
-		out, err := json.Marshal(bundle)
-		if err != nil {
-			return err
-		}
-		os.Stdout.Write(out)
-		fmt.Println()
-		return nil
-	}
-	if *doHTML {
-		return bundle.PrintHTML(os.Stdout, "")
 	}
 	lastURL := ""
 	bridge := bloks.InterpBridge{
@@ -209,6 +260,10 @@ func mainE() error {
 					return err
 				}
 			}
+			return nil
+		},
+		CancelTimer: func(name string) error {
+			fmt.Printf("timer cancelled: %s\n", name)
 			return nil
 		},
 		OpenURL: func(url string) error {
@@ -254,7 +309,7 @@ func mainE() error {
 			if script == nil {
 				continue
 			}
-			_, err := interp.Evaluate(ctx, &script.AST)
+			_, err := interp.Evaluate(bloks.InterpBindThis(ctx, mount), &script.AST)
 			if err != nil {
 				return err
 			}
@@ -262,7 +317,7 @@ func mainE() error {
 	}
 	if *doAction {
 		gotNewScreen := false
-		if *doLogin {
+		if *doPageFromAction {
 			interp.Bridge.DisplayNewScreen = func(ctx context.Context, name string, newBundle *bloks.BloksBundle) error {
 				bundle = newBundle
 				interp, err = bloks.NewInterpreter(ctx, bundle, &bridge, interp, true)
@@ -277,12 +332,31 @@ func mainE() error {
 		if err != nil {
 			return err
 		}
-		if !*doLogin {
+		if !*doPageFromAction {
 			return nil
 		}
 		if !gotNewScreen {
 			return fmt.Errorf("didn't get new screen from action")
 		}
+	}
+	if *doPrint {
+		return bundle.Print(os.Stdout, "")
+	}
+	if *doRedact {
+		bundle.Redact()
+		return bundle.Print(os.Stdout, "")
+	}
+	if *doExport {
+		out, err := json.Marshal(bundle)
+		if err != nil {
+			return err
+		}
+		os.Stdout.Write(out)
+		fmt.Println()
+		return nil
+	}
+	if *doHTML {
+		return bundle.PrintHTML(os.Stdout, "")
 	}
 	fillTextInput := func(fieldName string, fillText string) error {
 		input := bundle.FindDescendant(func(comp *bloks.BloksTreeComponent) bool {
@@ -464,8 +538,9 @@ func mainE() error {
 				return false
 			}
 			for _, prefix := range []string{
-				"We sent a notification",
+				"We sent a",
 				"Open the notification",
+				"You need to sign in on",
 			} {
 				if strings.HasPrefix(comp.GetAttribute("text"), prefix) {
 					return true
@@ -492,6 +567,9 @@ func mainE() error {
 	} else if *captcha {
 		getURLs := func() (string, string, error) {
 			img := bundle.FindDescendant(bloks.FilterByAttribute("bk.components.Image", "unique_id", "i:com.bloks.www.two_step_verification.enter_text_captcha_code/p:captcha_image"))
+			if img == nil {
+				img = bundle.FindDescendant(bloks.FilterByAttribute("bk.components.Image", "scale_type", "stretch"))
+			}
 			if img == nil {
 				return "", "", fmt.Errorf("can't find captcha image")
 			}
@@ -529,7 +607,7 @@ func mainE() error {
 		fmt.Println("Image:", imageURL)
 		fmt.Println("Audio:", audioURL)
 		if *doCaptcha != "" {
-			err := bundle.
+			input := bundle.
 				FindDescendant(func(comp *bloks.BloksTreeComponent) bool {
 					if comp.ComponentID != "bk.components.TextInput" {
 						return false
@@ -537,7 +615,11 @@ func mainE() error {
 					return comp.FindDescendant(bloks.FilterByAttribute(
 						"bk.components.AccessibilityExtension", "label", "Enter characters",
 					)) != nil
-				}).
+				})
+			if input == nil {
+				input = bundle.FindDescendant(bloks.FilterByComponent("bk.components.TextInput"))
+			}
+			err := input.
 				FillInput(ctx, interp, *doCaptcha)
 			if err != nil {
 				return fmt.Errorf("filling captcha code input: %w", err)
@@ -607,13 +689,11 @@ func mainE() error {
 	} else if *doWhatsAppNumbers {
 		buttons := bundle.
 			FindDescendants(func(comp *bloks.BloksTreeComponent) bool {
-				if comp.ComponentID != "bk.components.AccessibilityExtension" {
-					return false
+				switch comp.ComponentID {
+				case "bk.components.AccessibilityExtension", "accessibilityExtension":
+					return strings.HasPrefix(comp.GetAttribute("label"), "+") || strings.Contains(comp.GetAttribute("label"), "@")
 				}
-				if !strings.HasPrefix(comp.GetAttribute("label"), "+") {
-					return false
-				}
-				return true
+				return false
 			})
 		foundNumbers := map[string]*bloks.BloksTreeComponent{}
 		fmt.Printf("Found %d WhatsApp number(s):\n", len(buttons))
@@ -635,6 +715,14 @@ func mainE() error {
 			TapButton(ctx, interp)
 		if err != nil {
 			return fmt.Errorf("tap continue: %w", err)
+		}
+	} else if *cancelPasskey {
+		btn := bundle.
+			FindDescendant(bloks.FilterByAttribute("bk.data.TextSpan", "text", "Try another way")).
+			FindContainingButton()
+		err := btn.TapButton(ctx, interp)
+		if err != nil {
+			return fmt.Errorf("tapping try another way button: %w", err)
 		}
 	}
 	return nil

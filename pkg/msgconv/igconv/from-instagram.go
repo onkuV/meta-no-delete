@@ -27,6 +27,7 @@ import (
 	"strings"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/ptr"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
@@ -57,6 +58,7 @@ func (mc *MessageConverter) ToMatrix(
 	ctx context.Context,
 	portal *bridgev2.Portal,
 	client *instameow.Client,
+	userLogin *bridgev2.UserLogin,
 	intent bridgev2.MatrixAPI,
 	messageID networkid.MessageID,
 	msg *slidetypes.Message,
@@ -64,6 +66,7 @@ func (mc *MessageConverter) ToMatrix(
 ) *bridgev2.ConvertedMessage {
 	ctx = context.WithValue(ctx, mediadl.ContextKeyIGClient, client)
 	ctx = context.WithValue(ctx, mediadl.ContextKeyIntent, intent)
+	ctx = context.WithValue(ctx, mediadl.ContextKeyUserLogin, userLogin)
 	ctx = context.WithValue(ctx, mediadl.ContextKeyPortal, portal)
 	ctx = context.WithValue(ctx, mediadl.ContextKeyFetchXMA, !disableXMA)
 	ctx = context.WithValue(ctx, mediadl.ContextKeyMsgID, messageID)
@@ -74,16 +77,17 @@ func (mc *MessageConverter) ToMatrix(
 		cm.ReplyTo = &networkid.MessageOptionalPartID{
 			MessageID: metaid.MakeFBMessageID(msg.RepliedToMessageID),
 		}
-		cm.ReplyToUser = metaid.MakeUserID(msg.RepliedToMessage.SenderFBID)
-		cm.ReplyToLogin = metaid.MakeUserLoginID(msg.RepliedToMessage.SenderFBID)
+		if msg.RepliedToMessage != nil {
+			cm.ReplyToUser = metaid.MakeUserID(msg.RepliedToMessage.SenderFBID)
+			cm.ReplyToLogin = metaid.MakeUserLoginID(msg.RepliedToMessage.SenderFBID)
+		}
 	}
 	switch content := msg.Content.Content.(type) {
 	case *slidetypes.MessageContentText:
 		cm.Parts = append(cm.Parts, mc.wrapText(ctx, content.TextBody, msg.Mentions))
 	case *slidetypes.MessageContentAdminText:
-		adminText := mc.wrapAdminText(content.TextFragments)
-		// TODO find out if there are any important admin text messages that should be bridged
-		adminText.DontBridge = true
+		adminText := mc.wrapAdminText(content.TextFragments, msg.IGDSnippet)
+		mc.mutateWrappedAdminText(adminText, msg)
 		cm.Parts = append(cm.Parts, adminText)
 	case *slidetypes.MessageContentImage:
 		for i, att := range content.Attachments {
@@ -148,7 +152,9 @@ func (mc *MessageConverter) ToMatrix(
 				cm.Parts = append(cm.Parts, textPart)
 			}
 		} else {
-			cm.Parts = append(cm.Parts, mc.wrapUnsupportedContent(content))
+			unrecognizedPart := mc.wrapUnsupportedContent(content)
+			unrecognizedPart.DontBridge = xmaLooksLikeWhatsAppButton(content.XMA)
+			cm.Parts = append(cm.Parts, unrecognizedPart)
 		}
 	case *slidetypes.MessageContentAIRichResponse:
 		// TODO the AI types haven't been observed in the wild to confirm the schema
@@ -187,12 +193,32 @@ func (mc *MessageConverter) wrapText(ctx context.Context, text string, mentions 
 	}
 }
 
-func (mc *MessageConverter) wrapAdminText(fragments []slidetypes.TextFragment) *bridgev2.ConvertedMessagePart {
+func (mc *MessageConverter) mutateWrappedAdminText(part *bridgev2.ConvertedMessagePart, msg *slidetypes.Message) {
+	switch msg.ContentType {
+	case "IG_VIDEO_CALL_XMAT":
+		// TODO include call metadata if possible
+	default:
+		part.DontBridge = true
+	}
+}
+
+func (mc *MessageConverter) wrapAdminText(fragments []slidetypes.TextFragment, snippet string) *bridgev2.ConvertedMessagePart {
+	if len(fragments) == 0 {
+		return &bridgev2.ConvertedMessagePart{
+			Type: event.EventMessage,
+			Content: &event.MessageEventContent{
+				MsgType: event.MsgNotice,
+				Body:    snippet,
+			},
+		}
+	}
 	var buf strings.Builder
 	for _, f := range fragments {
 		htmlText := event.TextToHTML(f.Plaintext)
-		if f.LinkFragment != nil {
-			_, _ = buf.WriteString(fmt.Sprintf(`<a href="%s">%s</a>`, html.EscapeString(f.LinkFragment.URI), htmlText))
+		uri := ptr.Val(f.LinkFragment).URI
+		// TODO convert instagram://user?username=... links into mentions?
+		if strings.HasPrefix(uri, "http") {
+			_, _ = buf.WriteString(fmt.Sprintf(`<a href="%s">%s</a>`, html.EscapeString(uri), htmlText))
 		} else {
 			buf.WriteString(htmlText)
 		}

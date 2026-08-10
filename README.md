@@ -4,6 +4,11 @@ Fork of mautrix-meta, but with deleting of messages deleted. Instead of a messag
 
 You can find a pushed Docker image ready to use here: https://github.com/users/onkuV/packages/container/package/matrix-meta-nodelete
 
+This repo contains two bridges: mautrix-meta for Facebook Messenger and
+mautrix-instagram for Instagram DMs. When setting up the Instagram bridge,
+note the differences in setup instructions (different build script, different
+docker tags, etc).
+
 ## Documentation
 All setup and usage instructions are located on [docs.mau.fi]. Some quick links:
 

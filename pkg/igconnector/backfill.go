@@ -138,7 +138,9 @@ func (ic *IGClient) fetchBackwardBackfill(ctx context.Context, params bridgev2.F
 	if !ok || cursorVal == "" {
 		cursor = nil
 		if params.AnchorMessage == nil {
-			return nil, fmt.Errorf("no cursor or anchor message provided for backward backfill")
+			// TODO is it possible to hit this for non-empty chats?
+			zerolog.Ctx(ctx).Debug().Msg("Returning empty response to backwards backfill request with no cursor nor anchor")
+			return &bridgev2.FetchMessagesResponse{}, nil
 		}
 		rawParsed := metaid.ParseMessageID(params.AnchorMessage.ID)
 		parsed, ok := rawParsed.(metaid.ParsedFBMessageID)
@@ -198,7 +200,7 @@ func (ic *IGClient) wrapBackfillMessages(
 		}
 		out[i] = &bridgev2.BackfillMessage{
 			ConvertedMessage: ic.Main.MsgConv.ToMatrix(
-				ctx, portal, ic.Client, intent, msgID, msg.Node,
+				ctx, portal, ic.Client, ic.UserLogin, intent, msgID, msg.Node,
 				ic.Main.Config.DisableXMABackfill || ic.Main.Config.DisableXMAAlways,
 			),
 			Sender:      sender,

@@ -28,7 +28,6 @@ import (
 	"maunium.net/go/mautrix/event"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
-	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
 )
 
@@ -55,7 +54,7 @@ func (m *MetaConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
 }
 
 func (m *MetaConnector) GetBridgeInfoVersion() (info, caps int) {
-	return 1, 15
+	return 1, 16
 }
 
 const MaxTextLength = 20000
@@ -71,7 +70,7 @@ func supportedIfFFmpeg() event.CapabilitySupportLevel {
 }
 
 func capID() string {
-	base := "fi.mau.meta.capabilities.2026_07_07"
+	base := "fi.mau.meta.capabilities.2026_07_21"
 	if ffmpeg.Supported() {
 		return base + "+ffmpeg"
 	}
@@ -174,8 +173,6 @@ var metaCaps = &event.RoomFeatures{
 var metaCapsWithThreads *event.RoomFeatures
 var metaCapsWithE2E *event.RoomFeatures
 var metaCapsWithE2EGroup *event.RoomFeatures
-var igCaps *event.RoomFeatures
-var igCapsGroup *event.RoomFeatures
 var metaCapsGroup *event.RoomFeatures
 
 func init() {
@@ -194,7 +191,6 @@ func init() {
 	}
 	delete(metaCapsWithE2E.File[event.MsgVideo].MimeTypes, "video/webm")
 	delete(metaCapsWithE2E.File[event.MsgVideo].MimeTypes, "video/ogg")
-	metaCapsWithE2E.DeleteChat = false
 	metaCapsWithE2EGroup = metaCapsWithE2E.Clone()
 	metaCapsWithE2EGroup.ID += "+group"
 	metaCapsWithE2EGroup.MemberActions = map[event.MemberAction]event.CapabilitySupportLevel{
@@ -209,23 +205,6 @@ func init() {
 		event.StateRoomAvatar.Type: {Level: event.CapLevelFullySupported},
 	}
 	metaCapsGroup.MemberActions = metaCapsWithE2EGroup.MemberActions.Clone()
-
-	igCaps = metaCaps.Clone()
-	delete(igCaps.File, event.MsgFile)
-	for _, value := range igCaps.File {
-		value.Caption = event.CapLevelDropped
-	}
-	igCaps.MessageRequest = &event.MessageRequestFeatures{
-		AcceptWithButton: event.CapLevelFullySupported,
-	}
-	igCaps.ID += "+instagram"
-	igCapsGroup = igCaps.Clone()
-	igCapsGroup.ID += "+instagram-group"
-	igCapsGroup.State = event.StateFeatureMap{
-		event.StateRoomName.Type:   {Level: event.CapLevelFullySupported},
-		event.StateRoomAvatar.Type: {Level: event.CapLevelFullySupported},
-	}
-	igCapsGroup.MemberActions = metaCapsWithE2EGroup.MemberActions.Clone()
 }
 
 func (m *MetaClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
@@ -236,12 +215,6 @@ func (m *MetaClient) GetCapabilities(ctx context.Context, portal *bridgev2.Porta
 		return metaCapsWithE2E
 	case table.ENCRYPTED_OVER_WA_GROUP:
 		return metaCapsWithE2EGroup
-	}
-	if m.Client.GetPlatform() == types.Instagram || m.Main.Config.Mode == types.Instagram {
-		if portal.RoomType == database.RoomTypeDM {
-			return igCaps
-		}
-		return igCapsGroup
 	}
 	if portal.RoomType == database.RoomTypeDM {
 		return metaCaps

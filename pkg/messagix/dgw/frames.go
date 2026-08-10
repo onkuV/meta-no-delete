@@ -28,6 +28,15 @@ import (
 	"github.com/coder/websocket"
 )
 
+const (
+	CloseStatusGracefulClose    websocket.StatusCode = 4000
+	CloseStatusKeepaliveTimeout websocket.StatusCode = 4001
+	CloseStatusDGWServerError   websocket.StatusCode = 4002
+	CloseStatusUnauthorized     websocket.StatusCode = 4003
+	CloseStatusRejected         websocket.StatusCode = 4004
+	CloseStatusBadRequest       websocket.StatusCode = 4005
+)
+
 type DrainReason uint8
 
 const (
@@ -58,22 +67,37 @@ func (dr DrainReason) String() string {
 type FrameType uint8
 
 const (
-	// There are some additional frame types in the web client
-	// enum, but they are not used in the code.
-
-	FrameTypeDrain       FrameType = 0x03 // Drain
-	FrameTypePing        FrameType = 0x09 // Ping
-	FrameTypePong        FrameType = 0x0a // Pong
-	FrameTypeAck         FrameType = 0x0c // StreamGroup_Ack
-	FrameTypeData        FrameType = 0x0d // StreamGroup_Data
-	FrameTypeEndOfData   FrameType = 0x0e // StreamGroup_EndOfData
-	FrameTypeEstabStream FrameType = 0x0f // StreamGroup_EstabStream
+	FrameTypeEmpty                 FrameType = 2
+	FrameTypeDrain                 FrameType = 3
+	FrameTypeDeauth                FrameType = 4
+	FrameTypeDeprecatedEstabStream FrameType = 5
+	FrameTypeDeprecatedData        FrameType = 6
+	FrameTypeSmallAck              FrameType = 7
+	FrameTypeDeprecatedEndOfData   FrameType = 8
+	FrameTypePing                  FrameType = 9
+	FrameTypePong                  FrameType = 10
+	FrameTypeAck                   FrameType = 12
+	FrameTypeData                  FrameType = 13
+	FrameTypeEndOfData             FrameType = 14
+	FrameTypeEstabStream           FrameType = 15
 )
 
 func (ft FrameType) String() string {
 	switch ft {
+	case FrameTypeEmpty:
+		return "FrameTypeEmpty"
 	case FrameTypeDrain:
 		return "FrameTypeDrain"
+	case FrameTypeDeauth:
+		return "FrameTypeDeauth"
+	case FrameTypeDeprecatedEstabStream:
+		return "FrameTypeDeprecatedEstabStream"
+	case FrameTypeDeprecatedData:
+		return "FrameTypeDeprecatedData"
+	case FrameTypeSmallAck:
+		return "FrameTypeSmallAck"
+	case FrameTypeDeprecatedEndOfData:
+		return "FrameTypeDeprecatedEndOfData"
 	case FrameTypePing:
 		return "FrameTypePing"
 	case FrameTypePong:
@@ -95,6 +119,8 @@ func CheckFrameType(b []byte) Frame {
 	switch FrameType(b[0]) {
 	case FrameTypeDrain:
 		return &DrainFrame{}
+	case FrameTypeDeauth:
+		return &DeauthFrame{}
 	case FrameTypePing:
 		return &PingFrame{}
 	case FrameTypePong:
@@ -172,6 +198,26 @@ func (f *DrainFrame) Unmarshal(bytes []byte) ([]byte, error) {
 
 func (f *DrainFrame) String() string {
 	return fmt.Sprintf("DrainFrame{Reason: %s}", f.DrainReason)
+}
+
+type DeauthFrame struct {
+	//
+}
+
+func (f *DeauthFrame) Length() int {
+	return 1
+}
+
+func (f *DeauthFrame) MarshalAppend(b []byte) []byte {
+	return append(b, byte(FrameTypeDeauth))
+}
+
+func (f *DeauthFrame) Unmarshal(b []byte) ([]byte, error) {
+	return b[1:], nil
+}
+
+func (f *DeauthFrame) String() string {
+	return "DeauthFrame{}"
 }
 
 type PingFrame struct {
@@ -324,14 +370,14 @@ func (f *EndOfDataFrame) MarshalAppend(b []byte) []byte {
 
 func (f *EndOfDataFrame) Unmarshal(bytes []byte) ([]byte, error) {
 	if len(bytes) < 3 {
-		return nil, fmt.Errorf("input too short for CloseFrame")
+		return nil, fmt.Errorf("input too short for EndOfDataFrame")
 	}
 	f.StreamID = StreamID(binary.LittleEndian.Uint16(bytes[1:3]))
 	return bytes[3:], nil
 }
 
 func (f *EndOfDataFrame) String() string {
-	return fmt.Sprintf("CloseFrame{StreamID: %d}", f.StreamID)
+	return fmt.Sprintf("EndOfDataFrame{StreamID: %d}", f.StreamID)
 }
 
 type EstablishStreamFrame struct {

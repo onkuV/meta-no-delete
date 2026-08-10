@@ -52,11 +52,13 @@ type IGClient struct {
 	caughtUp     *exsync.Event
 	catchingUpTo int64
 
-	stopConnectAttempt   atomic.Pointer[context.CancelFunc]
-	stopChatBackfill     atomic.Pointer[context.CancelFunc]
-	chatBackfillLock     sync.Mutex
-	mailboxProcessed     atomic.Bool
-	waitMailboxProcessed chan struct{}
+	pendingGroupCreations *exsync.Set[string]
+	stopConnectAttempt    atomic.Pointer[context.CancelFunc]
+	stopChatBackfill      atomic.Pointer[context.CancelFunc]
+	chatBackfillLock      sync.Mutex
+	mailboxProcessed      atomic.Bool
+	waitMailboxProcessed  chan struct{}
+	permanentErrored      atomic.Bool
 }
 
 func (ic *IGConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
@@ -66,6 +68,8 @@ func (ic *IGConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLo
 		LoginMeta: loginMetadata,
 		UserLogin: login,
 		caughtUp:  exsync.NewEvent(),
+
+		pendingGroupCreations: exsync.NewSet[string](),
 	}
 	c.mailboxProcessed.Store(true)
 	login.Client = c
@@ -162,6 +166,53 @@ func (ic *IGClient) Connect(ctx context.Context) {
 
 const MaxConnectRetries = 10
 
+func (ic *IGClient) errorToBridgeState(ctx context.Context, err error) (state *status.BridgeState) {
+	if errors.Is(err, httpclient.ErrTokenInvalidated) {
+		state = &status.BridgeState{
+			StateEvent: status.StateBadCredentials,
+			Error:      MetaCookieRemoved,
+		}
+		if errors.Is(err, httpclient.ErrTokenInvalidatedRedirect) {
+			state.Error = MetaRedirectedToLoginPage
+		} else if errors.Is(err, httpclient.ErrUserIDIsZero) {
+			state.Error = MetaUserIDIsZero
+		}
+		ic.Disconnect()
+		ic.LoginMeta.Cookies = nil
+		err = ic.UserLogin.Save(ctx)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Msg("Failed to save user login after clearing cookies")
+		}
+	} else if errors.Is(err, httpclient.ErrChallengeRequired) {
+		state = &status.BridgeState{
+			StateEvent: status.StateBadCredentials,
+			Error:      IGChallengeRequired,
+			UserAction: status.UserActionRestart,
+		}
+	} else if errors.Is(err, httpclient.ErrAccountSuspended) {
+		state = &status.BridgeState{
+			StateEvent: status.StateBadCredentials,
+			Error:      IGAccountSuspended,
+		}
+	} else if errors.Is(err, httpclient.ErrCheckpointRequired) {
+		state = &status.BridgeState{
+			StateEvent: status.StateBadCredentials,
+			Error:      FBCheckpointRequired,
+			UserAction: status.UserActionRestart,
+		}
+	} else if errors.Is(err, httpclient.ErrConsentRequired) {
+		state = &status.BridgeState{
+			StateEvent: status.StateBadCredentials,
+			Error:      IGConsentRequired,
+			UserAction: status.UserActionRestart,
+		}
+	}
+	if state != nil {
+		ic.permanentErrored.Store(true)
+	}
+	return
+}
+
 func (ic *IGClient) connectWithRetry(retryCtx, ctx context.Context, attempts int) {
 	if retryCtx.Err() != nil {
 		return
@@ -185,6 +236,7 @@ func (ic *IGClient) connectWithRetry(retryCtx, ctx context.Context, attempts int
 			return
 		}
 	}
+	ic.permanentErrored.Store(false)
 	if attempts > 0 {
 		retryIn := time.Duration(1<<attempts) * time.Second
 		zerolog.Ctx(ctx).Debug().Stringer("retry_in", retryIn).Msg("Sleeping before retrying connection")
@@ -216,53 +268,23 @@ func (ic *IGClient) connectWithRetry(retryCtx, ctx context.Context, attempts int
 	var err error
 	if cli.HasSeqID() {
 		zerolog.Ctx(ctx).Debug().Msg("Seq ID already stored, only reloading index")
-		err = cli.ReloadIndex(ctx)
+		_, err = cli.ReloadIndex(ctx)
 	} else {
 		currentUser, mailbox, err = cli.LoadIndex(ctx)
 	}
 	if err != nil {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to load index")
-		if errors.Is(err, httpclient.ErrTokenInvalidated) {
-			state := status.BridgeState{
-				StateEvent: status.StateBadCredentials,
-				Error:      MetaCookieRemoved,
-			}
-			if errors.Is(err, httpclient.ErrTokenInvalidatedRedirect) {
-				state.Error = MetaRedirectedToLoginPage
-			} else if errors.Is(err, httpclient.ErrUserIDIsZero) {
-				state.Error = MetaUserIDIsZero
-			}
-			ic.UserLogin.BridgeState.Send(state)
-			ic.Client = nil
-			ic.LoginMeta.Cookies = nil
-			err = ic.UserLogin.Save(ctx)
-			if err != nil {
-				zerolog.Ctx(ctx).Err(err).Msg("Failed to save user login after clearing cookies")
-			}
-		} else if errors.Is(err, httpclient.ErrChallengeRequired) {
-			ic.UserLogin.BridgeState.Send(status.BridgeState{
-				StateEvent: status.StateBadCredentials,
-				Error:      IGChallengeRequired,
-				UserAction: status.UserActionRestart,
-			})
-		} else if errors.Is(err, httpclient.ErrAccountSuspended) {
-			ic.UserLogin.BridgeState.Send(status.BridgeState{
-				StateEvent: status.StateBadCredentials,
-				Error:      IGAccountSuspended,
-			})
-		} else if errors.Is(err, httpclient.ErrCheckpointRequired) {
-			ic.UserLogin.BridgeState.Send(status.BridgeState{
-				StateEvent: status.StateBadCredentials,
-				Error:      FBCheckpointRequired,
-				UserAction: status.UserActionRestart,
-			})
-		} else if errors.Is(err, httpclient.ErrConsentRequired) {
-			ic.UserLogin.BridgeState.Send(status.BridgeState{
-				StateEvent: status.StateBadCredentials,
-				Error:      IGConsentRequired,
-				UserAction: status.UserActionRestart,
-			})
+		if state := ic.errorToBridgeState(ctx, err); state != nil {
+			ic.UserLogin.BridgeState.Send(*state)
 		} else if lsErr := (&types.ErrorResponse{}); errors.As(err, &lsErr) {
+			if errors.Is(err, types.ErrPleaseReloadPage) {
+				err = ic.Main.DB.DeleteReconnectionState(ctx, ic.UserLogin.ID)
+				if err != nil {
+					zerolog.Ctx(ctx).Err(err).Msg("Failed to delete reconnection state after please reload page error")
+				} else {
+					zerolog.Ctx(ctx).Debug().Msg("Deleted reconnection state after please reload page error")
+				}
+			}
 			stateEvt := status.StateUnknownError
 			if lsErr.ErrorCode == 1357053 {
 				stateEvt = status.StateBadCredentials
@@ -342,6 +364,7 @@ func (ic *IGClient) connectWithMailbox(ctx, retryCtx context.Context, currentUse
 }
 
 func (ic *IGClient) Disconnect() {
+	ic.permanentErrored.Store(false)
 	if stopConnectAttempt := ic.stopConnectAttempt.Swap(nil); stopConnectAttempt != nil {
 		(*stopConnectAttempt)()
 	}
@@ -355,7 +378,7 @@ func (ic *IGClient) Disconnect() {
 }
 
 func (ic *IGClient) IsLoggedIn() bool {
-	return ic.Client.IsAuthenticated()
+	return ic.Client.IsAuthenticated() && !ic.permanentErrored.Load()
 }
 
 func (ic *IGClient) IsThisUser(ctx context.Context, userID networkid.UserID) bool {
