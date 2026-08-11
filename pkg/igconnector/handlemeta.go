@@ -32,6 +32,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
 
+	"go.mau.fi/mautrix-meta/pkg/deletenotice"
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
 	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
@@ -289,7 +290,7 @@ func (ic *IGClient) handleDelta(ctx context.Context, d *slidetypes.Delta) error 
 	case *slidetypes.DeleteReactionEvent:
 		res = ic.handleReactionDelete(ctx, portalKey, evt)
 	case *slidetypes.DeleteMessageEvent:
-		res = ic.handleMessageDelete(portalKey, evt.MessageID)
+		res = ic.handleMessageDelete(ctx, portalKey, evt.MessageID)
 	case *slidetypes.DeleteThreadEvent:
 		res = ic.handleThreadDelete(portalKey)
 	case *slidetypes.PinThreadEvent:
@@ -458,13 +459,26 @@ func (ic *IGClient) handleReactionDelete(ctx context.Context, portalKey networki
 	})
 }
 
-func (ic *IGClient) handleMessageDelete(portalKey networkid.PortalKey, id string) bridgev2.EventHandlingResult {
-	return ic.UserLogin.QueueRemoteEvent(&simplevent.MessageRemove{
+// handleMessageDelete intercepts Instagram unsends and posts a notice as a
+// reply to the deleted message instead of redacting it.
+func (ic *IGClient) handleMessageDelete(ctx context.Context, portalKey networkid.PortalKey, id string) bridgev2.EventHandlingResult {
+	zerolog.Ctx(ctx).Info().Str("deleted_message_id", id).Msg("Intercepted message delete attempt, sending notice instead.")
+	ts := time.Now()
+	return ic.UserLogin.QueueRemoteEvent(&simplevent.Message[string]{
 		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventMessageRemove,
+			Type:      bridgev2.RemoteEventMessage,
 			PortalKey: portalKey,
+			Timestamp: ts,
+			LogContext: func(c zerolog.Context) zerolog.Context {
+				return c.Str("deleted_message_id", id)
+			},
 		},
-		TargetMessage: metaid.MakeFBMessageID(id),
+		Data: id,
+		// The notice needs its own ID so it doesn't collide with the deleted message's row.
+		ID: metaid.MakeFBMessageID(fmt.Sprintf("delete_notice_%s_%d", id, ts.UnixMilli())),
+		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data string) (*bridgev2.ConvertedMessage, error) {
+			return deletenotice.Make(data, metaid.MakeFBMessageID(data)), nil
+		},
 	})
 }
 

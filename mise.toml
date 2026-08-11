@@ -1,3 +1,7 @@
 [tasks.docker-publish]
-description = "Build and push docker image to GHCR"
-run = "docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/onkuV/matrix-meta-nodelete:latest --push ."
+description = "Build and push the Messenger docker image to GHCR"
+run = "docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile -t ghcr.io/onkuV/matrix-meta-nodelete:latest --push ."
+
+[tasks.docker-publish-ig]
+description = "Build and push the Instagram docker image to GHCR"
+run = "docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.ig -t ghcr.io/onkuV/matrix-meta-nodelete:ig-latest --push ."

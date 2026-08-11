@@ -20,6 +20,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 
+	"go.mau.fi/mautrix-meta/pkg/deletenotice"
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/methods"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
@@ -509,7 +510,7 @@ func (evt *WAMessageEvent) ConvertMessage(ctx context.Context, portal *bridgev2.
 		zerolog.Ctx(ctx).Info().
 			Str("deleted_message_id", deletedID).
 			Msg("Intercepted E2EE message delete attempt, sending notice instead.")
-		return makeDeleteNoticeMessage(deletedID, replyTo), nil
+		return deletenotice.Make(deletedID, replyTo), nil
 	}
 	return evt.m.Main.MsgConv.WhatsAppToMatrix(ctx, portal, evt.m.Client, evt.m.E2EEClient, evt.m.UserLogin, intent, evt.GetID(), evt.FBMessage), nil
 }
@@ -620,26 +621,7 @@ func (evt *DeleteNoticeEvent) GetTimestamp() time.Time {
 }
 
 func (evt *DeleteNoticeEvent) ConvertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI) (*bridgev2.ConvertedMessage, error) {
-	return makeDeleteNoticeMessage(evt.deletedMessageID, metaid.MakeFBMessageID(evt.deletedMessageID)), nil
-}
-
-// makeDeleteNoticeMessage builds the bridged "deletion attempted" notice used by
-// both the LS-tabular and E2EE delete intercepts. replyTo may be empty when the
-// underlying network ID of the deleted message cannot be resolved.
-func makeDeleteNoticeMessage(deletedID string, replyTo networkid.MessageID) *bridgev2.ConvertedMessage {
-	msg := &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
-			Type: event.EventMessage,
-			Content: &event.MessageEventContent{
-				MsgType: event.MsgText,
-				Body:    fmt.Sprintf("🚮 Message deletion attempted (ID: %s)", deletedID),
-			},
-		}},
-	}
-	if replyTo != "" {
-		msg.ReplyTo = &networkid.MessageOptionalPartID{MessageID: replyTo}
-	}
-	return msg
+	return deletenotice.Make(evt.deletedMessageID, metaid.MakeFBMessageID(evt.deletedMessageID)), nil
 }
 
 type FBChatResync struct {
