@@ -21,6 +21,21 @@ jobs:
       packages: write
       id-token: write
 
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Messenger bridge (mautrix-meta), published without a tag prefix.
+          - variant: fb
+            dockerfile: Dockerfile
+            prefix: ''
+          # Instagram bridge (mautrix-instagram), published as ig-latest, ig-main, ...
+          - variant: ig
+            dockerfile: Dockerfile.ig
+            prefix: 'ig-'
+
+    name: build-and-push (${{ matrix.variant }})
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,6 +64,9 @@ jobs:
             type=ref,event=tag
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
+          # onlatest=true also prefixes the "latest" tag, so it becomes ig-latest.
+          flavor: |
+            prefix=${{ matrix.prefix }},onlatest=true
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -58,4 +76,4 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          file: Dockerfile
+          file: ${{ matrix.dockerfile }}
