@@ -42,7 +42,7 @@ func (m *MetaConnector) CreateLogin(ctx context.Context, user *bridgev2.User, fl
 	switch flowID {
 	case FlowIDFacebookCookies:
 		plat = types.Facebook
-		if m.Config.Mode == types.FacebookTor {
+		if m.Config.Tor {
 			plat = types.FacebookTor
 		}
 	case FlowIDMessengerCookies:
@@ -112,56 +112,18 @@ var (
 	}
 	loginFlowMessengerLiteIOS = bridgev2.LoginFlow{
 		Name:        "Messenger iOS",
-		Description: "Login in using Messenger iOS API",
+		Description: "Login with username/password using Messenger iOS API",
 		ID:          FlowIDMessengerLiteIOS,
 	}
 	loginFlowMessengerLiteAndroid = bridgev2.LoginFlow{
 		Name:        "Messenger Android",
-		Description: "Login in using Messenger Android API",
+		Description: "Login with username/password using Messenger Android API",
 		ID:          FlowIDMessengerLiteAndroid,
 	}
 )
 
 func (m *MetaConnector) GetLoginFlows() []bridgev2.LoginFlow {
-	if len(m.Config.AllowedModes) > 0 {
-		flows := []bridgev2.LoginFlow{}
-		// Note that we return login flows in whatever order
-		// the user specified them in the config file.
-		for _, mode := range m.Config.AllowedModes {
-			switch mode {
-			case types.Facebook:
-				flows = append(flows, loginFlowFacebook)
-			case types.Messenger:
-				flows = append(flows, loginFlowMessenger)
-			case types.MessengerLiteIOS:
-				flows = append(flows, loginFlowMessengerLiteIOS)
-			case types.MessengerLiteAndroid:
-				flows = append(flows, loginFlowMessengerLiteAndroid)
-			default:
-				panic("unknown mode in config")
-			}
-		}
-		return flows
-	}
-	switch m.Config.Mode {
-	case types.Unset:
-		return []bridgev2.LoginFlow{loginFlowFacebook, loginFlowMessenger, loginFlowMessengerLiteIOS, loginFlowMessengerLiteAndroid}
-	case types.Facebook:
-		if m.Config.AllowMessengerComOnFB {
-			return []bridgev2.LoginFlow{loginFlowMessenger, loginFlowFacebook}
-		}
-		fallthrough
-	case types.FacebookTor:
-		return []bridgev2.LoginFlow{loginFlowFacebook}
-	case types.Messenger:
-		return []bridgev2.LoginFlow{loginFlowMessenger}
-	case types.MessengerLiteIOS:
-		return []bridgev2.LoginFlow{loginFlowMessengerLiteIOS}
-	case types.MessengerLiteAndroid:
-		return []bridgev2.LoginFlow{loginFlowMessengerLiteAndroid}
-	default:
-		panic("unknown mode in config")
-	}
+	return []bridgev2.LoginFlow{loginFlowFacebook, loginFlowMessenger, loginFlowMessengerLiteIOS, loginFlowMessengerLiteAndroid}
 }
 
 type MetaCookieLogin struct {
@@ -322,7 +284,7 @@ func (m *MetaCookieLogin) SubmitCookies(ctx context.Context, strCookies map[stri
 		return nil, ErrLoginMissingCookies.AppendMessage(": %v", missingCookies)
 	}
 
-	log := m.User.Log.With().Str("component", "messagix").Logger()
+	log := zerolog.Ctx(ctx).With().Str("component", "messagix").Logger()
 	client, err := getMessagixClient(log, m.Main, c, m.Main.Config.ProxyOther)
 	if err != nil {
 		return nil, err
@@ -345,7 +307,7 @@ func (m *MetaNativeLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error
 }
 
 func (m *MetaNativeLogin) StartWithParams(ctx context.Context, params bridgev2.LoginStartParams) (*bridgev2.LoginStep, error) {
-	log := m.User.Log.With().Str("component", "messagix").Logger()
+	log := zerolog.Ctx(ctx).With().Str("component", "messagix").Logger()
 	log.Debug().
 		Bool("client_http", params.HTTP != nil).
 		Msg("Starting Messenger Lite login flow")
@@ -375,7 +337,7 @@ func (m *MetaNativeLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error)
 }
 
 func (m *MetaNativeLogin) proceed(ctx context.Context, userInput map[string]string) (*bridgev2.LoginStep, error) {
-	log := m.User.Log.With().Str("component", "messagix").Logger()
+	log := zerolog.Ctx(ctx).With().Str("component", "messagix").Logger()
 
 	step, newCookies, err := m.SavedClient.MessengerLite.DoLoginSteps(ctx, userInput)
 	if err != nil {

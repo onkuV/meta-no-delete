@@ -45,10 +45,11 @@ type InterpBridge struct {
 type Interpreter struct {
 	Bridge InterpBridge
 
-	Scripts    map[BloksScriptID]*BloksLambda
-	Payloads   map[BloksPayloadID]*BloksBundleRef
-	LocalVars  map[BloksVariableID]*BloksScriptLiteral
-	GlobalVars map[BloksVariableID]*BloksScriptLiteral
+	Scripts      map[BloksScriptID]*BloksLambda
+	Payloads     map[BloksPayloadID]*BloksBundleRef
+	LocalVars    map[BloksVariableID]*BloksScriptLiteral
+	GlobalVars   map[BloksVariableID]*BloksScriptLiteral
+	SessionStore map[string]*BloksScriptLiteral
 }
 
 func NewInterpreter(ctx context.Context, b *BloksBundle, br *InterpBridge, old *Interpreter, clearLocals bool) (*Interpreter, error) {
@@ -57,11 +58,13 @@ func NewInterpreter(ctx context.Context, b *BloksBundle, br *InterpBridge, old *
 	payloads := map[BloksPayloadID]*BloksBundleRef{}
 	globals := map[BloksVariableID]*BloksScriptLiteral{}
 	locals := map[BloksVariableID]*BloksScriptLiteral{}
+	sessionStore := map[string]*BloksScriptLiteral{}
 	if old != nil {
 		maps.Copy(scripts, old.Scripts)
 		maps.Copy(payloads, old.Payloads)
 		maps.Copy(globals, old.GlobalVars)
 		maps.Copy(locals, old.LocalVars)
+		maps.Copy(sessionStore, old.SessionStore)
 	}
 	for id, script := range p.Scripts {
 		scripts[id] = &BloksLambda{
@@ -99,10 +102,11 @@ func NewInterpreter(ctx context.Context, b *BloksBundle, br *InterpBridge, old *
 	interp := Interpreter{
 		Bridge: *br,
 
-		Scripts:    scripts,
-		Payloads:   payloads,
-		GlobalVars: globals,
-		LocalVars:  locals,
+		Scripts:      scripts,
+		Payloads:     payloads,
+		GlobalVars:   globals,
+		LocalVars:    locals,
+		SessionStore: sessionStore,
 	}
 	br = &interp.Bridge
 	if br.DeviceID == "" {
@@ -376,8 +380,6 @@ type checkpointsFlow struct {
 }
 
 func getBloksType(lit *BloksScriptLiteral) (int64, error) {
-	// TBD: What are types 5 and 8?
-	// I get the sense type 8 may be a function closure.
 	switch lit.Value().(type) {
 	case nil:
 		return 0, nil
@@ -393,7 +395,10 @@ func getBloksType(lit *BloksScriptLiteral) (int64, error) {
 		return 6, nil
 	case map[string]*BloksScriptLiteral:
 		return 7, nil
+	case *BloksLambda:
+		return 8, nil
 	}
+	// Native code would return 5 in this case
 	return -1, fmt.Errorf("unexpected bloks typecheck for %T", lit.Value())
 }
 
@@ -561,7 +566,7 @@ func (i *Interpreter) Evaluate(ctx context.Context, form *BloksScriptNode) (*Blo
 			return nil, err
 		}
 		return BloksLiteralOf(first + second), nil
-	case "jmu":
+	case "jmu", "jn3":
 		lhs, err := i.Evaluate(ctx, &call.Args[0])
 		if err != nil {
 			return nil, err
@@ -570,18 +575,25 @@ func (i *Interpreter) Evaluate(ctx context.Context, form *BloksScriptNode) (*Blo
 		if err != nil {
 			return nil, err
 		}
+		subtract := call.Function == "jn3"
 		lhsInt, lhsIsInt := lhs.Value().(int64)
 		rhsInt, rhsIsInt := rhs.Value().(int64)
 		if lhsIsInt && rhsIsInt {
+			if subtract {
+				return BloksLiteralOf(lhsInt - rhsInt), nil
+			}
 			return BloksLiteralOf(lhsInt + rhsInt), nil
 		}
-		lhsFloat, err := castFloat(lhs, "jmu lhs")
+		lhsFloat, err := castFloat(lhs, string(call.Function)+" lhs")
 		if err != nil {
 			return nil, err
 		}
-		rhsFloat, err := castFloat(rhs, "jmu rhs")
+		rhsFloat, err := castFloat(rhs, string(call.Function)+" rhs")
 		if err != nil {
 			return nil, err
+		}
+		if subtract {
+			return BloksLiteralOf(lhsFloat - rhsFloat), nil
 		}
 		return BloksLiteralOf(lhsFloat + rhsFloat), nil
 	case "bk.action.bloks.GetScript":
@@ -1091,6 +1103,14 @@ func (i *Interpreter) Evaluate(ctx context.Context, form *BloksScriptNode) (*Blo
 		if err != nil {
 			return nil, err
 		}
+		// Special case in the native code. 100 means either
+		// int or float. It's never returned by TypeOf.
+		if expected == 100 {
+			switch actual {
+			case 3, 4:
+				actual = expected
+			}
+		}
 		if expected != actual {
 			return nil, fmt.Errorf("bloks type assertion failure (%d != %d)", actual, expected)
 		}
@@ -1254,6 +1274,23 @@ func (i *Interpreter) Evaluate(ctx context.Context, form *BloksScriptNode) (*Blo
 			return nil, err
 		}
 		return nil, fmt.Errorf("%s", msg)
+	case "bk.action.callback.MakeWithScopeOnly":
+		return i.Evaluate(ctx, &call.Args[0])
+	case "bk.action.session_store.Get":
+		return BloksLiteralOf(i.SessionStore), nil
+	case "bk.action.map.Update":
+		target, err := evalAs[map[string]*BloksScriptLiteral](ctx, i, &call.Args[0], "map.update target")
+		if err != nil {
+			return nil, err
+		}
+		updates, err := evalAs[map[string]*BloksScriptLiteral](ctx, i, &call.Args[1], "map.update source")
+		if err != nil {
+			return nil, err
+		}
+		maps.Copy(target, updates)
+		return BloksLiteralOf(target), nil
+	case "bk.action.io.CurrentTimeMillis":
+		return BloksLiteralOf(time.Now().UnixMilli()), nil
 	case "bk.action.io.Toast":
 		msg, err := evalAs[string](ctx, i, &call.Args[0], "toast")
 		if err != nil {
@@ -1276,6 +1313,18 @@ func (i *Interpreter) Evaluate(ctx context.Context, form *BloksScriptNode) (*Blo
 		// triggering asynchronous execution. I really hope we can get away
 		// without actually doing that.
 		return i.Evaluate(ctx, &call.Args[1])
+	case "bk.action.i64.Convert":
+		arg, err := i.Evaluate(ctx, &call.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		switch val := arg.Value().(type) {
+		case int64:
+			return BloksLiteralOf(val), nil
+		case float64:
+			return BloksLiteralOf(int64(val)), nil
+		}
+		return nil, fmt.Errorf("can't convert %T to i64", arg.Value())
 	case "bk.fx.action.FetchAllAvailableNativeAuthDataForCaller",
 		"bk.action.cds.internal.GetContainerMode",
 		"bk.action.caa.GetSPIEligibility":
@@ -1292,6 +1341,10 @@ func (i *Interpreter) Evaluate(ctx context.Context, form *BloksScriptNode) (*Blo
 		"bk.action.qpl.MarkerPoint",
 		"bk.action.qpl.MarkerEndV2",
 		"bk.action.bloks.DismissKeyboard",
+		"bk.action.bloks.ShowKeyboard",
+		"bk.action.accessibility.Announcement",
+		"bk.action.toast.ShowToastV2",
+		"bk.action.accessibility.SetFocus",
 		"bk.action.qpl.userflow.MarkPointV2",
 		"bk.action.qpl.userflow.EndFlowSuccessV2",
 		"bk.action.qpl.userflow.AnnotateV2",
