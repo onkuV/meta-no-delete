@@ -311,11 +311,40 @@ var (
 	ErrRequestFailed            = errors.New("failed to send request")
 	ErrResponseReadFailed       = errors.New("failed to read response body")
 	ErrUnexpectedError          = errors.New("server returned unexpected HTTP status")
+	ErrRateLimited              = fmt.Errorf("%w 429", ErrUnexpectedError)
 	ErrMaxRetriesReached        = errors.New("maximum retries reached")
 	ErrTooManyRedirects         = errors.New("too many redirects")
 	ErrUserIDIsZero             = fmt.Errorf("%w: user id in initial data is zero", ErrTokenInvalidated)
 	ErrVersionIDNotFound        = errors.New("version ID not found")
 )
+
+type RedirectedError struct {
+	Type error
+	URL  string
+}
+
+func (re RedirectedError) Error() string {
+	if errors.Is(re.Type, ErrChallengeRequired) || errors.Is(re.Type, ErrCheckpointRequired) {
+		return fmt.Sprintf("%v: redirected", re.Type)
+	}
+	return fmt.Sprintf("%v: redirected to %s", re.Type, re.URL)
+}
+
+func (re RedirectedError) Unwrap() error {
+	return re.Type
+}
+
+func GetErrorRedirectURL(err error) string {
+	if re, ok := errors.AsType[RedirectedError](err); ok {
+		return re.URL
+	}
+	return ""
+}
+
+func accountVerificationPath(path string) (challenge, checkpoint bool) {
+	path = "/" + strings.Trim(path, "/") + "/"
+	return strings.Contains(path, "/challenge/") || strings.Contains(path, "/auth_platform/"), strings.Contains(path, "/checkpoint/")
+}
 
 func IsPermanentRequestError(err error) bool {
 	return errors.Is(err, ErrTokenInvalidated) ||
@@ -323,6 +352,7 @@ func IsPermanentRequestError(err error) bool {
 		errors.Is(err, ErrCheckpointRequired) ||
 		errors.Is(err, ErrConsentRequired) ||
 		errors.Is(err, ErrAccountSuspended) ||
+		errors.Is(err, ErrRateLimited) ||
 		errors.Is(err, ErrTooManyRedirects)
 }
 
@@ -333,24 +363,34 @@ func (c *HTTPClient) checkHTTPRedirect(req *http.Request, via []*http.Request) e
 	if len(via) > 5 {
 		return ErrTooManyRedirects
 	}
+	challengeRedirect, checkpointRedirect := accountVerificationPath(req.URL.Path)
 	if !strings.HasSuffix(req.URL.Hostname(), "fbcdn.net") && !strings.HasSuffix(req.URL.Hostname(), "facebookcooa4ldbat4g7iacswl3p2zrf5nuylvnhxn6kqolvojixwid.onion") {
-		var prevURL string
-		if len(via) > 0 {
-			prevURL = via[len(via)-1].URL.String()
+		logEvent := c.log.Warn()
+		if challengeRedirect || checkpointRedirect {
+			logEvent = logEvent.Str("redirect_type", "account_verification")
+		} else {
+			var prevURL string
+			if len(via) > 0 {
+				previous := via[len(via)-1].URL
+				previousChallenge, previousCheckpoint := accountVerificationPath(previous.Path)
+				if previousChallenge || previousCheckpoint {
+					prevURL = "account_verification"
+				} else {
+					prevURL = previous.String()
+				}
+			}
+			logEvent = logEvent.Stringer("url", req.URL).Str("prev_url", prevURL)
 		}
-		c.log.Warn().
-			Stringer("url", req.URL).
-			Str("prev_url", prevURL).
-			Msg("HTTP request was redirected")
+		logEvent.Msg("HTTP request was redirected")
 	}
-	if strings.HasPrefix(req.URL.Path, "/challenge/") {
-		return fmt.Errorf("%w: redirected to %s", ErrChallengeRequired, req.URL.String())
+	if challengeRedirect {
+		return RedirectedError{Type: ErrChallengeRequired, URL: req.URL.String()}
 	} else if req.URL.Path == "/accounts/suspended/" {
-		return fmt.Errorf("%w: redirected to %s", ErrAccountSuspended, req.URL.String())
+		return RedirectedError{Type: ErrAccountSuspended, URL: req.URL.String()}
 	} else if req.URL.Path == "/consent/" || strings.HasPrefix(req.URL.Path, "/privacy/consent/") {
-		return fmt.Errorf("%w: redirected to %s", ErrConsentRequired, req.URL.String())
-	} else if strings.HasPrefix(req.URL.Path, "/checkpoint/") {
-		return fmt.Errorf("%w: redirected to %s", ErrCheckpointRequired, req.URL.String())
+		return RedirectedError{Type: ErrConsentRequired, URL: req.URL.String()}
+	} else if checkpointRedirect {
+		return RedirectedError{Type: ErrCheckpointRequired, URL: req.URL.String()}
 	}
 	respCookies := req.Response.Cookies()
 	for _, cookie := range respCookies {
@@ -395,7 +435,7 @@ func (c *HTTPClient) makeRequest(
 	for {
 		attempts++
 		start := time.Now()
-		resp, respDat, err := c.makeRequestDirect(ctx, url, method, headers, payload, contentType)
+		resp, respDat, err := c.MakeRequestOnce(ctx, url, method, headers, payload, contentType)
 		dur := time.Since(start)
 		if err == nil {
 			logContext(c.log.Debug()).
@@ -441,8 +481,22 @@ func (c *HTTPClient) makeRequest(
 	}
 }
 
-func (c *HTTPClient) makeRequestDirect(ctx context.Context, url string, method string, headers http.Header, payload []byte, contentType types.ContentType) (*http.Response, []byte, error) {
-	newRequest, err := http.NewRequestWithContext(ctx, method, url, bytes.NewBuffer(payload))
+func (c *HTTPClient) MakeRequestOnce(ctx context.Context, url string, method string, headers http.Header, payload []byte, contentType types.ContentType) (*http.Response, []byte, error) {
+	return c.makeRequestOnce(ctx, c.HTTP, url, method, headers, payload, contentType)
+}
+
+// MakeRequestOnceNoRedirect returns the first response so callers can persist
+// cookies before deciding whether a redirect target is safe to follow.
+func (c *HTTPClient) MakeRequestOnceNoRedirect(ctx context.Context, url string, method string, headers http.Header, payload []byte, contentType types.ContentType) (*http.Response, []byte, error) {
+	httpClient := *c.HTTP
+	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return c.makeRequestOnce(ctx, &httpClient, url, method, headers, payload, contentType)
+}
+
+func (c *HTTPClient) makeRequestOnce(ctx context.Context, httpClient *http.Client, requestURL string, method string, headers http.Header, payload []byte, contentType types.ContentType) (*http.Response, []byte, error) {
+	newRequest, err := http.NewRequestWithContext(ctx, method, requestURL, bytes.NewBuffer(payload))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -453,15 +507,27 @@ func (c *HTTPClient) makeRequestDirect(ctx context.Context, url string, method s
 
 	newRequest.Header = headers
 
-	response, err := c.HTTP.Do(newRequest)
+	response, err := httpClient.Do(newRequest)
 	defer func() {
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
 	}()
 	if err != nil {
+		if response != nil && (errors.Is(err, ErrChallengeRequired) || errors.Is(err, ErrCheckpointRequired)) {
+			// Keep checkpoint cookies without rotating the proxy. http.Client.Do
+			// wraps the redirect error with a URL that may contain private tokens.
+			return response, nil, errors.Unwrap(err)
+		}
+		challengePath, checkpointPath := accountVerificationPath(newRequest.URL.Path)
+		if challengePath || checkpointPath {
+			err = errors.Unwrap(err)
+		}
 		c.UpdateProxy(fmt.Sprintf("http request error: %v", err.Error()))
 		return nil, nil, fmt.Errorf("%w: %w", ErrRequestFailed, err)
+	}
+	if response.StatusCode == http.StatusTooManyRequests {
+		return response, nil, ErrRateLimited
 	}
 
 	responseBody, err := io.ReadAll(response.Body)
@@ -480,7 +546,10 @@ func (c *HTTPClient) makeRequestDirect(ctx context.Context, url string, method s
 func (c *HTTPClient) fetchPageData(ctx context.Context, page string) ([]byte, error) {
 	headers := c.BuildHeaders(true, true)
 	//headers.Set("host", m.client.getEndpoint("host"))
-	_, responseBody, err := c.MakeRequest(ctx, page, "GET", headers, nil, types.NONE)
+	response, responseBody, err := c.MakeRequest(ctx, page, "GET", headers, nil, types.NONE)
+	if response != nil {
+		c.parent.GetCookies().UpdateFromResponse(response)
+	}
 	return responseBody, err
 }
 

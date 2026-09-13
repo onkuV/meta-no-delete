@@ -58,6 +58,9 @@ var sessionEndpoint = flag.String("session-endpoint", "", "Override the create_s
 var newAppID = flag.String("new-app-id", "", "Request the session for this app instead of our own")
 var appAuth = flag.Bool("app-auth", false, "Send the first-party app authorization header with -exchange-token")
 var sweepAppIDs = flag.Bool("sweep-app-ids", false, "Try -exchange-token against every known first-party app ID")
+var doRecaptcha = flag.Bool("recaptcha", false, "Extract the recaptcha webview url")
+var doContinue = flag.Bool("continue", false, "Just tap the continue button")
+var doPassword = flag.Bool("password", false, "Fill the password field and click log in (account-recovery password form)")
 
 // Known first-party app IDs, for finding one that the session exchange accepts.
 var knownAppIDs = []struct{ ID, Name string }{
@@ -452,6 +455,15 @@ func mainE() error {
 		if err != nil {
 			return err
 		}
+	} else if *doPassword {
+		err = fillTextInput("password", "correct horse battery staple")
+		if err != nil {
+			return err
+		}
+		err = tapButton("Log in")
+		if err != nil {
+			return err
+		}
 	} else if *do2FA != "" {
 		codeInput := bundle.FindDescendant(func(comp *bloks.BloksTreeComponent) bool {
 			if comp.ComponentID != "bk.components.TextInput" {
@@ -523,6 +535,7 @@ func mainE() error {
 				"We sent a",
 				"Open the notification",
 				"You need to sign in on",
+				"Check your notifications",
 			} {
 				if strings.HasPrefix(comp.GetAttribute("text"), prefix) {
 					return true
@@ -559,7 +572,12 @@ func mainE() error {
 			if imageURL == "" {
 				return "", "", fmt.Errorf("captcha image has no url")
 			}
-			audio := bundle.FindDescendant(bloks.FilterByAttribute("bk.data.TextSpan", "text", "play audio"))
+			audio := bundle.FindDescendant(func(comp *bloks.BloksTreeComponent) bool {
+				if comp.ComponentID != "bk.data.TextSpan" {
+					return false
+				}
+				return strings.EqualFold(comp.GetAttribute("text"), "play audio")
+			})
 			if audio == nil {
 				return "", "", fmt.Errorf("can't find audio text")
 			}
@@ -705,6 +723,18 @@ func mainE() error {
 		err := btn.TapButton(ctx, interp)
 		if err != nil {
 			return fmt.Errorf("tapping try another way button: %w", err)
+		}
+	} else if *doRecaptcha {
+		webview := bundle.FindDescendantIncludingEmbedded(bloks.FilterByComponent("webview"))
+		fmt.Println(webview)
+		fmt.Println("URL:", webview.GetAttribute("url"))
+	} else if *doContinue {
+		err = bundle.
+			FindDescendant(bloks.FilterByAttribute("bk.data.TextSpan", "text", "Continue")).
+			FindContainingButton().
+			TapButton(ctx, interp)
+		if err != nil {
+			return fmt.Errorf("tap continue: %w", err)
 		}
 	}
 	return nil
