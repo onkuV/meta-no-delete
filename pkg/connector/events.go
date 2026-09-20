@@ -20,6 +20,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 
+	"go.mau.fi/mautrix-meta/pkg/deletenotice"
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/methods"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
@@ -298,7 +299,6 @@ var (
 	_ bridgev2.RemoteEventWithTimestamp   = (*WAMessageEvent)(nil)
 	_ bridgev2.RemoteReaction             = (*WAMessageEvent)(nil)
 	_ bridgev2.RemoteReactionRemove       = (*WAMessageEvent)(nil)
-	_ bridgev2.RemoteMessageRemove        = (*WAMessageEvent)(nil)
 	_ bridgev2.RemoteEventWithStreamOrder = (*WAMessageEvent)(nil)
 )
 
@@ -422,7 +422,8 @@ func (evt *WAMessageEvent) GetType() bridgev2.RemoteEventType {
 		case *waConsumerApplication.ConsumerApplication_Payload_ApplicationData:
 			switch applicationContent := payload.ApplicationData.GetApplicationContent().(type) {
 			case *waConsumerApplication.ConsumerApplication_ApplicationData_Revoke:
-				return bridgev2.RemoteEventMessageRemove
+				// Intercept E2EE revokes so the bridge posts a notice instead of redacting.
+				return bridgev2.RemoteEventMessage
 			default:
 				log.Warn().Type("content_type", applicationContent).Msg("Unrecognized application content type")
 			}
@@ -459,7 +460,8 @@ func (evt *WAMessageEvent) GetType() bridgev2.RemoteEventType {
 	case *instamadilloAddMessage.AddMessagePayload:
 		return bridgev2.RemoteEventMessage
 	case *instamadilloDeleteMessage.DeleteMessagePayload:
-		return bridgev2.RemoteEventMessageRemove
+		// Intercept Instagram E2EE deletes so the bridge posts a notice instead of redacting.
+		return bridgev2.RemoteEventMessage
 	default:
 		if evt.Message == nil && evt.FBApplication.GetMetadata().GetChatEphemeralSetting() != nil {
 			return bridgev2.RemoteEventMessage
@@ -504,7 +506,37 @@ func (evt *WAMessageEvent) GetStreamOrder() int64 {
 }
 
 func (evt *WAMessageEvent) ConvertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI) (*bridgev2.ConvertedMessage, error) {
+	if deletedID, replyTo, ok := evt.deleteNoticeInfo(); ok {
+		zerolog.Ctx(ctx).Info().
+			Str("deleted_message_id", deletedID).
+			Msg("Intercepted E2EE message delete attempt, sending notice instead.")
+		return deletenotice.Make(deletedID, replyTo), nil
+	}
 	return evt.m.Main.MsgConv.WhatsAppToMatrix(ctx, portal, evt.m.Client, evt.m.E2EEClient, evt.m.UserLogin, intent, evt.GetID(), evt.FBMessage), nil
+}
+
+// deleteNoticeInfo reports whether this event is an E2EE delete/revoke and, if
+// so, returns the underlying network message ID being deleted plus a resolved
+// reply target (which may be empty when the protocol does not give us enough
+// data to map the deletion onto a known message — currently the Instagram
+// instamadillo delete payload, which carries only an OTID).
+func (evt *WAMessageEvent) deleteNoticeInfo() (deletedID string, replyTo networkid.MessageID, ok bool) {
+	switch typedMsg := evt.Message.(type) {
+	case *waConsumerApplication.ConsumerApplication:
+		appData, isAppData := typedMsg.GetPayload().GetPayload().(*waConsumerApplication.ConsumerApplication_Payload_ApplicationData)
+		if !isAppData {
+			return "", "", false
+		}
+		revoke, isRevoke := appData.ApplicationData.GetApplicationContent().(*waConsumerApplication.ConsumerApplication_ApplicationData_Revoke)
+		if !isRevoke {
+			return "", "", false
+		}
+		key := revoke.Revoke.GetKey()
+		return key.GetID(), evt.m.waKeyToMessageID(evt.Info.Chat, evt.Info.Sender, key), true
+	case *instamadilloDeleteMessage.DeleteMessagePayload:
+		return typedMsg.GetMessageOtid(), "", true
+	}
+	return "", "", false
 }
 
 func (evt *WAMessageEvent) ConvertEdit(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message) (*bridgev2.ConvertedEdit, error) {
@@ -544,6 +576,52 @@ func (evt *WAMessageEvent) ConvertEdit(ctx context.Context, portal *bridgev2.Por
 	default:
 		return nil, fmt.Errorf("unsupported message type %T for edit conversion", evt.Message)
 	}
+}
+
+type DeleteNoticeEvent struct {
+	portalKey         networkid.PortalKey
+	uncertainReceiver bool
+	deletedMessageID  string
+	timestamp         time.Time
+	m                 *MetaClient
+}
+
+var (
+	_ bridgev2.RemoteMessage                          = (*DeleteNoticeEvent)(nil)
+	_ bridgev2.RemoteEventWithUncertainPortalReceiver = (*DeleteNoticeEvent)(nil)
+	_ bridgev2.RemoteEventWithTimestamp               = (*DeleteNoticeEvent)(nil)
+)
+
+func (evt *DeleteNoticeEvent) GetType() bridgev2.RemoteEventType {
+	return bridgev2.RemoteEventMessage
+}
+
+func (evt *DeleteNoticeEvent) GetPortalKey() networkid.PortalKey {
+	return evt.portalKey
+}
+
+func (evt *DeleteNoticeEvent) PortalReceiverIsUncertain() bool {
+	return evt.uncertainReceiver
+}
+
+func (evt *DeleteNoticeEvent) AddLogContext(c zerolog.Context) zerolog.Context {
+	return c.Str("deleted_message_id", evt.deletedMessageID)
+}
+
+func (evt *DeleteNoticeEvent) GetSender() bridgev2.EventSender {
+	return bridgev2.EventSender{}
+}
+
+func (evt *DeleteNoticeEvent) GetID() networkid.MessageID {
+	return metaid.MakeFBMessageID(fmt.Sprintf("delete_notice_%s_%d", evt.deletedMessageID, evt.timestamp.UnixMilli()))
+}
+
+func (evt *DeleteNoticeEvent) GetTimestamp() time.Time {
+	return evt.timestamp
+}
+
+func (evt *DeleteNoticeEvent) ConvertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI) (*bridgev2.ConvertedMessage, error) {
+	return deletenotice.Make(evt.deletedMessageID, metaid.MakeFBMessageID(evt.deletedMessageID)), nil
 }
 
 type FBChatResync struct {

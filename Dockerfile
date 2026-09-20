@@ -9,7 +9,7 @@ RUN ./build-fb.sh
 FROM alpine:3.24
 
 ENV UID=1337 \
-    GID=1337
+	GID=1337
 
 RUN apk add --no-cache ffmpeg su-exec ca-certificates olm bash jq yq-go curl
 
