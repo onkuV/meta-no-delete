@@ -45,6 +45,7 @@ const instagramWebTwoFactorValidateCodeDocID = "26264014419868193"
 
 var ErrInstagramWebCredentialsRejected = errors.New("instagram web credentials were rejected")
 var ErrInstagramWebLoginRejected = errors.New("instagram web sign-in was rejected")
+var ErrInstagramWebAccountPendingDeletion = errors.New("instagram account is pending deletion")
 var ErrInstagramWebTwoFactorCodeRejected = errors.New("instagram web two-factor code was rejected")
 var ErrInstagramWebTwoFactorCodeResent = fmt.Errorf("%w: replacement SMS requested", ErrInstagramWebTwoFactorCodeRejected)
 var ErrInstagramWebCheckpointRequestFailed = errors.New("instagram web checkpoint request failed")
@@ -59,6 +60,7 @@ type InstagramWebTwoFactorChallenge struct {
 	SMS          bool
 	WhatsApp     bool
 	Email        bool
+	ChallengeURL string
 }
 
 type instagramWebTwoFactorInfo struct {
@@ -336,6 +338,22 @@ func (c *Client) logInstagramWebRequestRejection(
 		Str("response_class", responseClass).
 		Strs("response_keys", instagramWebLoginResponseKeys(body)).
 		Strs("form_fields", instagramWebFormFields(form))
+	checkpointURL := gjson.GetBytes(body, "checkpoint_url").String()
+	redirectURL := gjson.GetBytes(body, "redirect_url").String()
+	logEvent = logEvent.
+		Bool("has_checkpoint_url", checkpointURL != "").
+		Bool("has_redirect_url", redirectURL != "")
+	if frt := gjson.GetBytes(body, "flow_render_type").String(); frt != "" {
+		logEvent = logEvent.Str("flow_render_type", frt)
+	}
+	if c.logRedactedLoginResponses {
+		if checkpointURL != "" {
+			logEvent = logEvent.Str("checkpoint_url", checkpointURL)
+		}
+		if redirectURL != "" {
+			logEvent = logEvent.Str("redirect_url", redirectURL)
+		}
+	}
 	if response != nil {
 		logEvent = logEvent.
 			Int("status_code", response.StatusCode).
@@ -504,6 +522,7 @@ func (c *Client) CreateInstagramWebSession(
 		[]byte(form.Encode()),
 		types.FORM,
 	)
+	c.logRedactedLoginResponse("password_login", response, body)
 	if response != nil {
 		c.cookies.UpdateFromResponse(response)
 	}
@@ -686,6 +705,7 @@ func (c *Client) resendInstagramWebTwoFactorSMS(ctx context.Context, state *inst
 		[]byte(form.Encode()),
 		types.FORM,
 	)
+	c.logRedactedLoginResponse("two_factor_resend_sms", response, body)
 	if response != nil {
 		c.cookies.UpdateFromResponse(response)
 		if csrfToken := c.cookies.Get(cookies.IGCookieCSRFToken); csrfToken != "" {
@@ -747,6 +767,7 @@ func (c *Client) completeInstagramWebTwoFactorLegacy(
 		[]byte(form.Encode()),
 		types.FORM,
 	)
+	c.logRedactedLoginResponse("two_factor_code", response, body)
 	if response != nil {
 		c.cookies.UpdateFromResponse(response)
 		if csrfToken := c.cookies.Get(cookies.IGCookieCSRFToken); csrfToken != "" {
@@ -812,6 +833,7 @@ func (c *Client) completeInstagramWebTwoFactorEncrypted(
 		[]byte(form.Encode()),
 		types.FORM,
 	)
+	c.logRedactedLoginResponse("two_factor_code_encrypted", response, body)
 	if response != nil {
 		c.cookies.UpdateFromResponse(response)
 		if csrfToken := c.cookies.Get(cookies.IGCookieCSRFToken); csrfToken != "" {
@@ -992,6 +1014,7 @@ func (c *Client) instagramWebGraphQLRequest(ctx context.Context, rq *httpclient.
 	// A lost response must not replay a password, verification code or CAPTCHA.
 	endpoint := c.GetEndpoint("graphql")
 	response, body, err := c.http.MakeRequestOnceNoRedirect(ctx, endpoint, http.MethodPost, headers, []byte(form.Encode()), types.FORM)
+	c.logRedactedLoginResponse(rq.FbAPIReqFriendlyName, response, body)
 	if response != nil {
 		if response.Request != nil && response.Request.URL != nil && response.Request.URL.String() != endpoint {
 			return nil, ErrInstagramWebCheckpointRequestFailed
