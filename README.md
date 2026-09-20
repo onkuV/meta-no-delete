@@ -2,7 +2,9 @@
 
 Fork of mautrix-meta, but with deleting of messages deleted. Instead of a message getting deleted, the bridge will instead alert you that the other user has attempted to delete a message.
 
-You can find a pushed Docker image ready to use here: https://github.com/users/onkuV/packages/container/package/matrix-meta-nodelete
+Source repository: [onkuV/meta-no-delete](https://github.com/onkuV/meta-no-delete)
+
+You can find a pushed Docker image ready to use here: https://github.com/users/onkuV/packages/container/package/meta-no-delete
 
 This repo contains two bridges: mautrix-meta for Facebook Messenger and
 mautrix-instagram for Instagram DMs. When setting up the Instagram bridge,
