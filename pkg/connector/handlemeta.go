@@ -541,10 +541,14 @@ func (m *MetaClient) handleTypingIndicator(tk handlerParams, msg *table.LSUpdate
 }
 
 func (m *MetaClient) handleDeleteMessage(tk handlerParams, msg *table.LSDeleteMessage) bridgev2.RemoteEvent {
+	// Deletes on hybrid (E2EE-migrated) threads arrive keyed by the old FB thread
+	// key; map them to the WA portal like read receipts do, or the notice is dropped.
+	m.mapPersistedHybridThread(&tk, msg.ThreadKey)
 	return m.wrapMessageDeleteNotice(tk, msg.MessageId)
 }
 
 func (m *MetaClient) handleDeleteThenInsertMessage(tk handlerParams, msg *table.LSDeleteThenInsertMessage) bridgev2.RemoteEvent {
+	m.mapPersistedHybridThread(&tk, msg.ThreadKey)
 	if !msg.IsUnsent {
 		zerolog.Ctx(tk.ctx).Warn().
 			Str("message_id", msg.MessageId).
