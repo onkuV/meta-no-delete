@@ -144,6 +144,27 @@ func (c *Client) EditGroupTitle(ctx context.Context, threadID, newTitle string) 
 	return err
 }
 
+func (c *Client) SetUserBlocked(ctx context.Context, userID string, blocked bool) error {
+	name := "IGDBlockUserDialogOffMsysUnblockMutation"
+	variables := map[string]any{"target_user_id": userID}
+	if blocked {
+		name = "IGDBlockUserDialogOffMsysMutation"
+		variables["surface"] = "direct_thread_info"
+	}
+	resp, err := makeGraphQLRequest[map[string]any](ctx, c, name, variables, true)
+	if err != nil {
+		return err
+	}
+	field := "xdt_unblock"
+	if blocked {
+		field = "xdt_block_v2"
+	}
+	if resp[field] == nil {
+		return fmt.Errorf("missing %s in block status response", field)
+	}
+	return nil
+}
+
 type noResp = json.RawMessage
 
 func makeGraphQLRequest[T any](ctx context.Context, c *Client, name string, req any, allowReload bool) (resp T, err error) {
@@ -164,7 +185,7 @@ func makeGraphQLRequest[T any](ctx context.Context, c *Client, name string, req 
 	} else if allowReload && wrappedResp.ErrorCode == types.ErrPleaseReloadPage.ErrorCode {
 		zerolog.Ctx(ctx).Warn().Err(wrappedResp.AsError()).
 			Msg("Got please reload page error, reloading index and retrying")
-		didReload, reloadErr := c.ReloadIndex(ctx)
+		didReload, reloadErr := c.ReloadIndex(context.WithoutCancel(ctx))
 		if reloadErr != nil {
 			zerolog.Ctx(ctx).Err(err).Msg("Failed to reload page to retry GraphQL request")
 		} else if didReload {
