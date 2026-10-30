@@ -56,6 +56,7 @@ type IGClient struct {
 	stopConnectAttempt    atomic.Pointer[context.CancelFunc]
 	stopChatBackfill      atomic.Pointer[context.CancelFunc]
 	chatBackfillLock      sync.Mutex
+	newLogin              bool
 	resyncChatsSince      atomic.Pointer[time.Time]
 	pushRegistrationLock  sync.Mutex
 	mailboxProcessed      atomic.Bool
@@ -159,6 +160,7 @@ func (ic *IGClient) ExportCredentials(ctx context.Context) any {
 
 func (ic *IGClient) Connect(ctx context.Context) {
 	if ic.LoginMeta.Platform != types.Instagram {
+		ic.permanentErrored.Store(true)
 		ic.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateBadCredentials, Error: MetaNotInstagram})
 		return
 	}
@@ -314,6 +316,7 @@ func (ic *IGClient) connectWithRetry(retryCtx, ctx context.Context, attempts int
 			stateEvt := status.StateUnknownError
 			if lsErr.ErrorCode == 1357053 {
 				stateEvt = status.StateBadCredentials
+				ic.permanentErrored.Store(true)
 			} else if attempts < MaxConnectRetries {
 				stateEvt = status.StateTransientDisconnect
 			}
@@ -407,7 +410,7 @@ func (ic *IGClient) Disconnect() {
 }
 
 func (ic *IGClient) IsLoggedIn() bool {
-	return ic.Client.IsAuthenticated() && !ic.permanentErrored.Load()
+	return ic.LoginMeta.Cookies != nil && !ic.permanentErrored.Load()
 }
 
 func (ic *IGClient) IsThisUser(ctx context.Context, userID networkid.UserID) bool {
