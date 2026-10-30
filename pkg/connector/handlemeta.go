@@ -84,7 +84,7 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 		m.firstE2EEConnectDone = true
 		go m.tryConnectE2EE(false)
 		m.metaState = status.BridgeState{StateEvent: status.StateConnected}
-		m.UserLogin.BridgeState.Send(m.metaState)
+		m.sendBridgeState(m.metaState)
 		if tbl := m.initialTable.Swap(nil); tbl != nil {
 			log.Debug().Msg("Handling cached initial table")
 			m.parseAndQueueTable(ctx, tbl, true)
@@ -98,11 +98,13 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 	case *messagix.TransientDisconnectEvent:
 		log.Debug().Err(evt.Err).Msg("Disconnected from Meta socket")
 		m.connectWaiter.Clear()
-		m.metaState = status.BridgeState{
-			StateEvent: status.StateTransientDisconnect,
-			Error:      MetaTransientDisconnect,
+		if m.metaState.StateEvent != status.StateBadCredentials {
+			m.metaState = status.BridgeState{
+				StateEvent: status.StateTransientDisconnect,
+				Error:      MetaTransientDisconnect,
+			}
+			m.sendBridgeState(m.metaState)
 		}
-		m.UserLogin.BridgeState.Send(m.metaState)
 		if errors.Is(evt.Err, messagix.ErrFatalSocketSyncError) && m.canReconnect() {
 			// Retrying the socket reuses the sync state from the last page load, so it
 			// keeps failing the same way until the page is loaded again.
@@ -116,12 +118,14 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 		}
 		log.Debug().Msg("Reconnected to Meta socket")
 		m.connectWaiter.Set()
-		m.metaState = status.BridgeState{StateEvent: status.StateConnected}
-		m.UserLogin.BridgeState.Send(m.metaState)
+		if m.metaState.StateEvent != status.StateBadCredentials {
+			m.metaState = status.BridgeState{StateEvent: status.StateConnected}
+			m.sendBridgeState(m.metaState)
+		}
 	case *messagix.PermanentErrorEvent:
 		// TODO do full reconnect in some cases?
-		m.permanentErrored.Store(true)
 		if websocket.CloseStatus(evt.Err) == dgw.CloseStatusUnauthorized {
+			m.permanentErrored.Store(true)
 			m.metaState = status.BridgeState{
 				StateEvent: status.StateBadCredentials,
 				Error:      DGWConnectionUnauthorized,
@@ -134,7 +138,7 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 				Info:       map[string]any{"go_error": evt.Err.Error()},
 			}
 		}
-		m.UserLogin.BridgeState.Send(m.metaState)
+		m.sendBridgeState(m.metaState)
 		if stopPeriodicReconnect := m.stopPeriodicReconnect.Swap(nil); stopPeriodicReconnect != nil {
 			(*stopPeriodicReconnect)()
 		}

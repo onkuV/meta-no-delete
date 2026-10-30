@@ -49,10 +49,18 @@ func (m *MetaConnector) GenerateTransactionID(userID id.UserID, roomID id.RoomID
 	return networkid.RawTransactionID(strconv.FormatInt(methods.GenerateEpochID(), 10))
 }
 
-var (
-	ErrServerRejectedMessage = bridgev2.WrapErrorInStatus(errors.New("server rejected message")).WithErrorAsMessage().WithSendNotice(true)
-	ErrNotConnected          = bridgev2.WrapErrorInStatus(errors.New("not connected")).WithErrorAsMessage().WithSendNotice(true)
-)
+var ErrServerRejectedMessage = bridgev2.WrapErrorInStatus(errors.New("server rejected message")).
+	WithMessage("rejected by Facebook, if this keeps happening, check the Facebook website or app for a notice on your account").
+	WithStatus(event.MessageStatusFail).
+	WithErrorReason(event.MessageStatusNetworkError).
+	WithIsCertain(true).
+	WithSendNotice(true)
+
+var ErrMessageNotConfirmed = bridgev2.WrapErrorInStatus(errors.New("server didn't confirm message")).
+	WithMessage("Facebook didn't confirm that the message was sent").
+	WithSendNotice(true)
+
+var ErrNotConnected = bridgev2.WrapErrorInStatus(errors.New("not connected")).WithErrorAsMessage().WithSendNotice(true)
 
 const ConnectWaitTimeout = 1 * time.Minute
 
@@ -114,6 +122,9 @@ func (m *MetaClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matr
 		if errors.Is(err, types.ErrPleaseReloadPage) && m.canReconnect() {
 			log.Debug().Err(err).Msg("Doing full reconnect and retrying upload")
 			m.FullReconnect()
+			if !m.connectWaiter.WaitTimeout(ConnectWaitTimeout) {
+				return nil, ErrNotConnected
+			}
 			tasks, err = m.Main.MsgConv.ToMeta(
 				ctx, m.Client, msg.Event, msg.Content, msg.ReplyTo, msg.ThreadRoot, otid, msg.OrigSender != nil, msg.Portal,
 			)
@@ -124,11 +135,13 @@ func (m *MetaClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matr
 			}
 			return nil, wrapMetaError(err)
 		} else if errors.Is(err, httpclient.ErrConsentRequired) {
-			m.UserLogin.BridgeState.Send(status.BridgeState{
+			m.permanentErrored.Store(true)
+			m.metaState = status.BridgeState{
 				StateEvent: status.StateBadCredentials,
 				Error:      FBConsentRequired,
 				UserAction: status.UserActionRestart,
-			})
+			}
+			m.sendBridgeState(m.metaState)
 			return nil, wrapMetaError(err)
 		} else if err != nil {
 			return nil, wrapConversionError(fmt.Errorf("failed to convert message: %w", err))
@@ -185,16 +198,16 @@ func (m *MetaClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matr
 				}
 				for _, failed := range resp.LSHandleFailedTask {
 					log.Warn().Str("message", failed.Message).Msg("Sending message failed (task)")
-					return nil, fmt.Errorf("%w: %s", ErrServerRejectedMessage, failed.Message)
+					return nil, fmt.Errorf("%w: %s", ErrMessageNotConfirmed, failed.Message)
 				}
-				return nil, fmt.Errorf("%w: message send response didn't include message ID", ErrServerRejectedMessage)
+				return nil, fmt.Errorf("%w: message send response didn't include message ID", ErrMessageNotConfirmed)
 			}
 		}
 		var parsedTSTime time.Time
 		parsedTS, err := methods.ParseMessageID(msgID)
 		if err != nil {
 			log.Warn().Err(err).Str("message_id", msgID).Msg("Failed to parse message ID")
-			return nil, fmt.Errorf("%w: failed to parse message ID: %v", ErrServerRejectedMessage, err)
+			return nil, fmt.Errorf("%w: failed to parse message ID: %v", ErrMessageNotConfirmed, err)
 		} else {
 			parsedTSTime = time.UnixMilli(parsedTS)
 			if parsedTSTime.Before(time.Now().Add(-1 * time.Hour)) {
@@ -538,6 +551,7 @@ func (m *MetaClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridg
 		Time("read_up_to", receipt.ReadUpTo).
 		Int("message_count", len(messages)).
 		Msg("Handling read receipt")
+	portalMeta := receipt.Portal.Metadata.(*metaid.PortalMetadata)
 	waMessagesToRead := make(map[waTypes.JID][]string)
 	fbMessagesToRead := make(map[int64]time.Time)
 	for _, msg := range messages {
@@ -548,6 +562,13 @@ func (m *MetaClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridg
 				fbMessagesToRead[threadKey] = msg.Timestamp
 			}
 		case metaid.ParsedWAMessageID:
+			readTS := msg.Timestamp
+			if readTS.Nanosecond() == 0 {
+				readTS = readTS.Add(999 * time.Millisecond)
+			}
+			if portalMeta.FBThreadKey != 0 && fbMessagesToRead[portalMeta.FBThreadKey].Before(readTS) {
+				fbMessagesToRead[portalMeta.FBThreadKey] = readTS
+			}
 			if msg.SenderID == networkid.UserID(m.UserLogin.ID) {
 				continue
 			}
@@ -564,6 +585,9 @@ func (m *MetaClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridg
 			continue
 		}
 		var syncGroup int64 = 1
+		if threadID == portalMeta.FBThreadKey {
+			syncGroup = 95
+		}
 		// TODO set sync group to 104 for community groups?
 		resp, err := m.Client.ExecuteTasks(ctx, &socket.ThreadMarkReadTask{
 			ThreadId:            threadID,
@@ -577,7 +601,7 @@ func (m *MetaClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridg
 			log.Debug().Time("read_watermark", fbMessageToReadTS).Msg("Read receipt sent")
 		}
 	}
-	portalJID := receipt.Portal.Metadata.(*metaid.PortalMetadata).JID(receipt.Portal.ID)
+	portalJID := portalMeta.JID(receipt.Portal.ID)
 	if len(waMessagesToRead) > 0 && !portalJID.IsEmpty() {
 		for messageSender, ids := range waMessagesToRead {
 			err = m.E2EEClient.MarkRead(ctx, ids, receipt.Receipt.Timestamp, portalJID, messageSender)
@@ -792,8 +816,8 @@ func (m *MetaClient) HandleMatrixRoomAvatar(ctx context.Context, msg *bridgev2.M
 }
 
 func (m *MetaClient) HandleMatrixMembership(ctx context.Context, msg *bridgev2.MatrixMembershipChange) (*bridgev2.MatrixMembershipResult, error) {
-	if msg.Portal.RoomType == database.RoomTypeDM {
-		return nil, errors.New("cannot change members for DM")
+	if (msg.Type.IsSelf && msg.OrigSender != nil) || msg.Portal.RoomType == database.RoomTypeDM {
+		return nil, nil
 	}
 
 	var targetID int64
