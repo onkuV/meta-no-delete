@@ -53,6 +53,7 @@ const (
 	IGChallengeRequired       status.BridgeStateErrorCode = "ig-challenge-required"
 	IGAccountSuspended        status.BridgeStateErrorCode = "ig-account-suspended"
 	IGConsentRequired         status.BridgeStateErrorCode = "ig-consent-required"
+	IGAccountRestricted       status.BridgeStateErrorCode = "ig-account-restricted"
 	FBCheckpointRequired      status.BridgeStateErrorCode = "fb-checkpoint-required"
 	MetaProxyUpdateFail       status.BridgeStateErrorCode = "meta-proxy-update-fail"
 	MetaNotInstagram          status.BridgeStateErrorCode = "meta-not-instagram-account"
@@ -72,6 +73,7 @@ func init() {
 		IGAccountSuspended:        "Logged out, please check the Instagram website to continue",
 		IGChallengeRequired:       "Challenge required, please check the Instagram website to continue",
 		IGConsentRequired:         "Consent required, please check the Instagram website to continue",
+		IGAccountRestricted:       "Instagram is limiting your account, please check the Instagram app or website to continue",
 		FBCheckpointRequired:      "Checkpoint required, please check the Facebook website to continue",
 		MetaConnectError:          "Unknown connection error",
 		MetaProxyUpdateFail:       "Failed to update proxy",
@@ -97,6 +99,7 @@ func (ic *IGClient) handleIGEvent(ctx context.Context, rawEvt slidetypes.ClientE
 	switch evt := rawEvt.(type) {
 	case *slidetypes.Connected:
 		ic.permanentErrored.Store(false)
+		ic.accountStateRechecks.Store(0)
 		stale := ic.isWebPushStale(ctx)
 		ic.webPushStaleReported.Store(stale)
 		if stale {

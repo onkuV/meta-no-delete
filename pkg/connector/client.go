@@ -40,22 +40,26 @@ type MetaClient struct {
 	UserLogin *bridgev2.UserLogin
 	Ghost     *bridgev2.Ghost
 
-	stopHandlingTables   atomic.Pointer[context.CancelFunc]
-	initialTable         atomic.Pointer[table.LSTable]
-	initialTableHandled  atomic.Bool
-	unhandledTables      atomic.Int32
-	parsedTables         []*parsedTable
-	parsedTablesLock     sync.Mutex
-	parsedTablesWake     chan struct{}
-	tableLoopLock        sync.Mutex
-	backfillCollectors   map[int64]*BackfillCollector
-	historyReadStates    *exsync.Map[int64, historyReadState]
-	backfillLock         sync.Mutex
-	connectLock          sync.Mutex
-	pushRegistrationLock sync.Mutex
-	stopConnectAttempt   atomic.Pointer[context.CancelFunc]
-	permanentErrored     atomic.Bool
-	reconnecting         atomic.Bool
+	stopHandlingTables     atomic.Pointer[context.CancelFunc]
+	initialTable           atomic.Pointer[table.LSTable]
+	initialTableHandled    atomic.Bool
+	unhandledTables        atomic.Int32
+	parsedTables           []*parsedTable
+	parsedTablesLock       sync.Mutex
+	parsedTablesWake       chan struct{}
+	tableLoopLock          sync.Mutex
+	backfillCollectors     map[int64]*BackfillCollector
+	historyReadStates      *exsync.Map[int64, historyReadState]
+	historyUploadLock      sync.Mutex
+	historyBackupID        string
+	historyBackupCheckedAt time.Time
+	backfillLock           sync.Mutex
+	mediaRefreshLock       exsync.KeyedMutex[int64]
+	connectLock            sync.Mutex
+	pushRegistrationLock   sync.Mutex
+	stopConnectAttempt     atomic.Pointer[context.CancelFunc]
+	permanentErrored       atomic.Bool
+	reconnecting           atomic.Bool
 
 	editChannels *exsync.Map[string, chan *FBEditEvent]
 
@@ -493,6 +497,13 @@ func (m *MetaClient) tryConnectE2EE(fromConnectFailure bool) {
 			m.UserLogin.Log.Err(err).Msg("Failed to connect to e2ee after 415 error")
 		} else {
 			m.UserLogin.Log.Err(err).Msg("Failed to connect to e2ee")
+		}
+		if errors.Is(err, messagix.ErrICDCUnauthorized) {
+			if !m.permanentErrored.Load() && m.canReconnect() {
+				m.UserLogin.Log.Debug().Msg("Doing full reconnect after e2ee device registration was unauthorized")
+				go m.FullReconnect()
+			}
+			return
 		}
 		m.scheduleE2EEReconnect()
 	}
