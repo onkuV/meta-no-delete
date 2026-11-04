@@ -76,6 +76,7 @@ func getOTID(inputTxnID networkid.RawTransactionID) int64 {
 }
 
 func (m *MetaClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
+	m.markActive(ctx)
 	if m.LoginMeta.Cookies == nil {
 		return nil, bridgev2.ErrNotLoggedIn
 	}
@@ -299,6 +300,7 @@ func wrapRevoke(message *waConsumerApplication.ConsumerApplication_RevokeMessage
 }
 
 func (m *MetaClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (*database.Reaction, error) {
+	m.markActive(ctx)
 	if m.LoginMeta.Cookies == nil {
 		return nil, bridgev2.ErrNotLoggedIn
 	}
@@ -392,6 +394,7 @@ func (m *MetaClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridge
 }
 
 func (m *MetaClient) HandleMatrixEdit(ctx context.Context, edit *bridgev2.MatrixEdit) error {
+	m.markActive(ctx)
 	if m.LoginMeta.Cookies == nil {
 		return bridgev2.ErrNotLoggedIn
 	}
@@ -545,6 +548,7 @@ func (m *MetaClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev
 }
 
 func (m *MetaClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev2.MatrixReadReceipt) error {
+	m.markActive(ctx)
 	if m.LoginMeta.Cookies == nil {
 		return bridgev2.ErrNotLoggedIn
 	}
@@ -633,6 +637,9 @@ func (m *MetaClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridg
 // whatsapp bridge, because they both use the same API.
 
 func (m *MetaClient) HandleMatrixViewingChat(ctx context.Context, msg *bridgev2.MatrixViewingChat) error {
+	if msg.Portal != nil {
+		m.markActive(ctx)
+	}
 	if m.E2EEClient == nil {
 		return nil
 	}
@@ -661,6 +668,9 @@ func (m *MetaClient) HandleMatrixViewingChat(ctx context.Context, msg *bridgev2.
 }
 
 func (m *MetaClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixTyping) error {
+	if msg.IsTyping {
+		m.markActive(ctx)
+	}
 	portalMeta := msg.Portal.Metadata.(*metaid.PortalMetadata)
 	if portalMeta.ThreadType.IsWhatsApp() {
 		portalJID := msg.Portal.Metadata.(*metaid.PortalMetadata).JID(msg.Portal.ID)

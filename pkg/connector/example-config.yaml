@@ -30,6 +30,12 @@ cache_connection_state: false
 # notifications? Currently, this only has an effect for E2EE chats on
 # Facebook/Messenger. Full presence bridging is not supported.
 send_presence_on_typing: false
+# Should the bridge report you as active to Meta while you use Matrix?
+# Sending messages, typing, reading or viewing chats marks you as active,
+# and you're reported inactive after active_status_timeout without activity.
+# Only affects Facebook/Messenger logins. Full presence bridging is not supported.
+send_active_status: false
+active_status_timeout: 5m
 # Should view-once messages be disabled entirely?
 disable_view_once: false
 # Should FB marketplace chats have a separate space inside the main Facebook space?

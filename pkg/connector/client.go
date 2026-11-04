@@ -88,6 +88,8 @@ type MetaClient struct {
 	waState   status.BridgeState
 
 	waLastPresence waTypes.Presence
+
+	activeStatus activeStatus
 }
 
 func (m *MetaConnector) getMessagixConfig() *messagix.Config {
@@ -658,6 +660,7 @@ func (m *MetaClient) Disconnect() {
 
 func (m *MetaClient) disconnect(dumpState bool) (state json.RawMessage) {
 	m.permanentErrored.Store(false)
+	m.resetActiveStatus()
 	if stopConnectAttempt := m.stopConnectAttempt.Swap(nil); stopConnectAttempt != nil {
 		(*stopConnectAttempt)()
 	}
