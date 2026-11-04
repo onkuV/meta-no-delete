@@ -36,6 +36,9 @@ type Config struct {
 	LogRedactedLoginResponses bool `yaml:"log_redacted_login_responses"`
 	E2EEBackfill              bool `yaml:"e2ee_backfill"`
 
+	SendActiveStatus    bool          `yaml:"send_active_status"`
+	ActiveStatusTimeout time.Duration `yaml:"active_status_timeout"`
+
 	ThreadBackfill ThreadBackfillConfig `yaml:"thread_backfill"`
 }
 
@@ -80,6 +83,8 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "marketplace_space")
 	helper.Copy(up.Bool, "log_redacted_login_responses")
 	helper.Copy(up.Bool, "e2ee_backfill")
+	helper.Copy(up.Bool, "send_active_status")
+	helper.Copy(up.Str|up.Int, "active_status_timeout")
 	helper.Copy(up.Int, "thread_backfill", "batch_count")
 	helper.Copy(up.Str|up.Int, "thread_backfill", "batch_delay")
 }
